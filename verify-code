@@ -94,8 +94,8 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║   🔐  verify-code  v2.0  🔐              ║", Style.CYAN, Style.BOLD))
-    print(c("  ║   Auto-copy codes · Find events · 📅     ║", Style.CYAN))
+    print(c("  ║         🔐  verify-code  v2.0  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║    Auto-copy codes · Find events · 📅    ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
