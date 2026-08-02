@@ -1039,6 +1039,142 @@ def setup():
     print()
     time.sleep(0.5)
 
+    # ── Check for existing credentials ──
+    existing_creds = None
+    if os.path.exists(CRED_FILE):
+        try:
+            with open(CRED_FILE) as f:
+                existing_creds = json.load(f)
+        except Exception:
+            pass
+
+    if existing_creds:
+        existing_provider = existing_creds.get("provider", "gmail")
+        existing_email = existing_creds.get("email", "?")
+        existing_label = IMAP_PROVIDERS.get(existing_provider, {}).get("label", existing_provider.title())
+        print(c(f"  Existing credentials found: {existing_email} ({existing_label})", Style.DIM))
+        keep = input(c("  Keep existing credentials? (Y/n): ", Style.BOLD)).strip().lower()
+        if keep != "n":
+            provider = existing_provider
+            provider_info = IMAP_PROVIDERS[provider]
+            email_addr = existing_email
+            password = existing_creds["password"]
+            print(c(f"  ✅  Using {existing_label} credentials for {email_addr}", Style.GREEN))
+            print()
+            # Jump to the Calendar step
+            print(c("  ── Step 3: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
+            print()
+            print("  I can also extract dates/times from emails (flights, appointments,")
+            print("  reservations, meetings) and add them to your Google Calendar.")
+            print()
+            want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
+            cal_ok = False
+            if want_cal in ("y", "yes"):
+                cal_ok = calendar_auth_flow()
+                if cal_ok:
+                    save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
+                               provider=provider, cal_token=True)
+            else:
+                print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
+            # Jump to clipboard
+            print()
+            print(c("  ── Step 4: Clipboard Tool ──", Style.CYAN, Style.BOLD))
+            print()
+            clipboard_ok = False
+            for cmd in ["wl-copy", "xclip", "pbcopy"]:
+                if subprocess.run(["which", cmd], capture_output=True).returncode == 0:
+                    clipboard_ok = True
+                    print(c(f"  ✅  {cmd} found — clipboard will work!", Style.GREEN))
+                    break
+            if not clipboard_ok:
+                print(c("  ⚠  No clipboard tool found.", Style.YELLOW))
+                print("  Install one: sudo apt install wl-clipboard (Wayland)")
+                print("  or:          sudo apt install xclip (X11)")
+                install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
+                if install in ("y", "yes"):
+                    ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
+                                       capture_output=True)
+                    if ret.returncode == 0:
+                        print(c("  ✅  wl-clipboard installed!", Style.GREEN))
+                        clipboard_ok = True
+                    else:
+                        print(c("  ✗  Installation failed. Install manually.", Style.RED))
+            # Jump to secure mode
+            print()
+            print(c("  ── Step 5: Secure Mode (optional) ──", Style.CYAN, Style.BOLD))
+            print()
+            print("  Secure mode automatically erases the verification code from your")
+            print("  clipboard after a set amount of time. This prevents accidentally")
+            print("  leaving sensitive codes lying around.")
+            print()
+            current_secure = existing_creds.get("secure", False)
+            current_timeout = existing_creds.get("secure_timeout", 30)
+            if current_secure:
+                print(c(f"  🔒  Currently: enabled ({current_timeout}s auto-erase)", Style.DIM))
+            change_secure = input(c("  🔒  Change Secure Mode settings? (y/N): ", Style.BOLD)).strip().lower()
+            secure_seconds = 0
+            if change_secure in ("y", "yes"):
+                want_secure = input(c("  🔒  Enable Secure Mode (auto-erase clipboard)? (y/N): ", Style.BOLD)).strip().lower()
+                if want_secure in ("y", "yes"):
+                    sec = input(c("  ⏱️  Erase after how many seconds? (default: 30): ", Style.BOLD)).strip()
+                    try:
+                        secure_seconds = int(sec) if sec else 30
+                    except ValueError:
+                        secure_seconds = 30
+                    print(c(f"  ✅  Secure mode: clipboard will be erased after {secure_seconds}s", Style.GREEN))
+                else:
+                    secure_seconds = 0
+                    print(c("  ❌  Secure mode disabled.", Style.YELLOW))
+            else:
+                secure_seconds = current_timeout if current_secure else 0
+            # Re-save with all settings
+            save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
+                       provider=provider, cal_token=cal_ok, secure=secure_seconds > 0, secure_timeout=secure_seconds)
+            # Skip to summary
+            print()
+            print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+            print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
+            print(c("  ╠══════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
+            print(c(f"  ║  ✉️  Provider:   {provider_info['label']:<15}         ║", Style.GREEN))
+            print(c(f"  ║  📅  Calendar:    {'Connected' if cal_ok else 'Not set up':<30} ║", Style.GREEN))
+            print(c(f"  ║  📋  Clipboard:   {'Ready' if clipboard_ok else 'Missing tool':<30} ║", Style.GREEN))
+            if secure_seconds > 0:
+                print(c(f"  ║  🔒  Secure:      {secure_seconds}s auto-erase        ║", Style.GREEN))
+            print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+            print()
+            print(c("  What now?", Style.BOLD))
+            print("  •  verify-code              — one-shot: copy latest code")
+            print("  •  verify-code daemon       — background: watch & auto-copy")
+            print("  •  verify-code scan         — scan inbox for events with dates/times")
+            print("  •  verify-code install      — auto-start on login + install to PATH")
+            print("  •  verify-code auth         — (re-)auth Google Calendar")
+            print("  •  verify-code version      — show installed version")
+            if secure_seconds > 0:
+                print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
+            # ── Install to PATH ──
+            print()
+            print(c("  ── Install to PATH ──", Style.CYAN, Style.BOLD))
+            print()
+            local_bin = os.path.expanduser("~/.local/bin")
+            local_script = os.path.join(local_bin, "verify-code")
+            script_path = os.path.abspath(sys.argv[0])
+            if os.path.abspath(local_script) != os.path.abspath(script_path):
+                ans = input(c("  📋  Copy verify-code to ~/.local/bin/? (Y/n): ", Style.BOLD)).strip().lower()
+                if ans != "n":
+                    os.makedirs(local_bin, exist_ok=True)
+                    with open(script_path) as f:
+                        content = f.read()
+                    with open(local_script, "w") as f:
+                        f.write(content)
+                    os.chmod(local_script, 0o755)
+                    print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
+                    if local_bin not in os.environ.get("PATH", ""):
+                        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+                        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+                        print(f"     source ~/.bashrc")
+            print()
+            return
+
     # ── Step 1: Provider ──
     print(c("  ── Step 1: Email Provider ──", Style.CYAN, Style.BOLD))
     print()
@@ -1183,9 +1319,9 @@ def setup():
     if secure_seconds > 0:
         print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
 
-    # ── Step 5: Install to PATH ──
+    # ── Step 7: Install to PATH ──
     print()
-    print(c("  ── Step 5: Install to PATH ──", Style.CYAN, Style.BOLD))
+    print(c("  ── Step 7: Install to PATH ──", Style.CYAN, Style.BOLD))
     print()
     local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
