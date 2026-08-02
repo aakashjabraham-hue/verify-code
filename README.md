@@ -1,8 +1,8 @@
 # verify-code 🔐 → 📅
 
-**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar.**
+**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar.** Supports **Gmail, Outlook, and Hotmail**.
 
-No more hunting through your inbox for that 2FA code. Verify-code watches your Gmail inbox (via IMAP), extracts verification codes, and copies them to your clipboard — instantly. It also finds dates, times, and events in your emails (flights, appointments, reservations, meetings) and adds them to your Google Calendar.
+No more hunting through your inbox for that 2FA code. Verify-code watches your inbox (via IMAP), extracts verification codes, and copies them to your clipboard — instantly. It also finds dates, times, and events in your emails (flights, appointments, reservations, meetings) and adds them to your Google Calendar.
 
 ## One-Liner Install
 
@@ -45,6 +45,17 @@ verify-code update
 - **Google Calendar integration** — 1-click OAuth, auto-adds events to your calendar
 - Configurable confidence threshold
 
+### ✉️ Multi-Provider Support
+- **Gmail** — IMAP via `imap.gmail.com`
+- **Outlook** — IMAP via `outlook.office365.com`
+- **Hotmail** — IMAP via `outlook.office365.com`
+- App Password required (not your regular password)
+
+### 🔒 Secure Mode
+- Auto-erases verification codes from clipboard after a configurable timeout
+- Prevents codes from lingering in your clipboard
+- Enable during setup or via `--secure --secure-timeout 15` on the daemon
+
 ### ⚡ Instant Delivery
 - IMAP IDLE push notifications — no polling
 - Falls back to smart polling automatically
@@ -58,15 +69,16 @@ verify-code update
 
 | Command | What it does |
 |---------|-------------|
-| `verify-code setup` | Interactive wizard: Gmail + Calendar + clipboard |
+| `verify-code setup` | Interactive wizard: provider + Calendar + clipboard + secure mode |
 | `verify-code` | One-shot: find & copy newest code |
 | `verify-code scan` | Scan inbox for events with dates/times (no copy) |
 | `verify-code daemon` | Background: watches inbox, auto-copies, auto-adds events |
-| `verify-code install` | Install to ~/.local/bin + systemd auto-start service |
-| `verify-code update` | Download the latest version from GitHub |
+| `verify-code install` | Download latest + install to ~/.local/bin + systemd service |
+| `verify-code update` | Check for updates; only downloads if newer version exists |
 | `verify-code uninstall` | Remove everything (script, config, data, service) |
 | `verify-code auth` | (Re-)authenticate Google Calendar |
 | `verify-code version` | Show the installed version |
+| `verify-code daemon --secure --secure-timeout 15` | Daemon with auto-erase after 15s |
 
 ## Options
 
@@ -78,13 +90,15 @@ verify-code update
 --calendar              Enable Google Calendar integration (daemon mode)
 --cal-threshold N       Minimum confidence % for calendar events (default: 50)
 --dry-run               Show what would be done, no clipboard or calendar action
+--secure                Enable secure mode (auto-erase clipboard after timeout)
+--secure-timeout N      Seconds before auto-erasing clipboard (default: 30)
 --version               Show version
 ```
 
 ## Requirements
 
 - Python 3.8+
-- Gmail account with [App Password](https://support.google.com/accounts/answer/185833)
+- Gmail, Outlook, or Hotmail account with [App Password](https://support.google.com/accounts/answer/185833)
 - `wl-clipboard` (Wayland), `xclip` (X11), or `pbcopy` (macOS)
 - (Optional) `google-auth-oauthlib` + `google-api-python-client` + `python-dateutil` for Calendar
 
@@ -94,6 +108,7 @@ verify-code update
 - Credentials in `~/.config/verify-code/` (chmod 600)
 - Atomic state writes with fsync + CRC — no corruption survival
 - Dedup tracking prevents re-copying codes or re-adding events
+- **Secure Mode** — auto-erases clipboard after configurable timeout
 - Open source — you can read every line (it's one self-contained script!)
 
 ## License

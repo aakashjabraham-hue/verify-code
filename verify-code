@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify-code v2.0 — grab verification codes, find dates/times, add to calendar.
+verify-code v2.1 — grab verification codes, find dates/times, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
@@ -12,7 +12,9 @@ Modes:
   verify-code version          Show the installed version.
   verify-code --version        Show the installed version (alternative).
 
-Safety:
+Features:
+  - Gmail, Outlook, and Hotmail IMAP support
+  - Secure Mode: auto-erase clipboard after N seconds
   - BODY.PEEK so messages are NEVER marked read.
   - IMAP IDLE for instant delivery (falls back to polling).
   - Known-sender whitelist (80+ senders) prevents false positives.
@@ -61,7 +63,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ── Paths ──────────────────────────────────────────────────────────────
 CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
@@ -73,7 +75,14 @@ SERVICE_FILE = os.path.expanduser("~/.config/systemd/user/verify-code.service")
 CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
 CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
 
-DEFAULT_IMAP = ("imap.gmail.com", 993)
+# ── IMAP Providers ────────────────────────────────────────────────────
+IMAP_PROVIDERS = {
+    "gmail":      {"host": "imap.gmail.com",        "port": 993, "label": "Gmail"},
+    "outlook":    {"host": "outlook.office365.com",  "port": 993, "label": "Outlook"},
+    "hotmail":    {"host": "outlook.office365.com",  "port": 993, "label": "Hotmail"},
+}
+
+DEFAULT_IMAP = (IMAP_PROVIDERS["gmail"]["host"], IMAP_PROVIDERS["gmail"]["port"])
 
 # ── Color helpers ──────────────────────────────────────────────────────
 class Style:
@@ -94,7 +103,7 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║         🔐  verify-code  v2.0  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║         🔐  verify-code  v2.1  🔐        ║", Style.CYAN, Style.BOLD))
     print(c("  ║    Auto-copy codes · Find events · 📅    ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
@@ -299,9 +308,13 @@ def load_creds():
 
 
 def save_creds(email_addr, password, host=DEFAULT_IMAP[0], port=DEFAULT_IMAP[1],
-               cal_token=None, cal_client=None):
+               cal_token=None, cal_client=None, provider=None, secure=False, secure_timeout=30):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    data = {"email": email_addr, "password": password, "host": host, "port": int(port)}
+    data = {"email": email_addr, "password": password, "host": host, "port": int(port),
+            "provider": provider or "gmail"}
+    if secure:
+        data["secure"] = True
+        data["secure_timeout"] = int(secure_timeout)
     if cal_token:
         data["calendar_authenticated"] = True
     with open(CRED_FILE, "w") as f:
@@ -396,6 +409,29 @@ def copy_clipboard(text):
         except (subprocess.TimeoutExpired, OSError):
             continue
     raise RuntimeError("No clipboard tool worked (install wl-clipboard for Wayland or xclip for X11).")
+
+
+def erase_clipboard():
+    """Erase clipboard contents by copying empty/whitespace."""
+    for cmd in [["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]]:
+        try:
+            if subprocess.run(["which", cmd[0]], capture_output=True, timeout=5).returncode == 0:
+                subprocess.run(cmd, input=b" " * 20, capture_output=True, timeout=5)
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+
+def secure_copy_clipboard(text, timeout=30):
+    """Copy code to clipboard and schedule auto-erase after `timeout` seconds."""
+    backend = copy_clipboard(text)
+    if timeout > 0:
+        def _erase():
+            time.sleep(timeout)
+            erase_clipboard()
+        t = threading.Thread(target=_erase, daemon=True)
+        t.start()
+    return backend
 
 
 def get_plain(msg):
@@ -1003,29 +1039,57 @@ def setup():
     print()
     time.sleep(0.5)
 
-    # ── Step 1: Gmail ──
-    print(c("  ── Step 1: Gmail Credentials ──", Style.CYAN, Style.BOLD))
+    # ── Step 1: Provider ──
+    print(c("  ── Step 1: Email Provider ──", Style.CYAN, Style.BOLD))
     print()
-    print("  I'll watch your Gmail inbox for verification codes.")
-    print("  You'll need a 16-character App Password (NOT your regular password).")
+    print("  Which email provider do you use?")
+    provider_keys = list(IMAP_PROVIDERS.keys())
+    for i, k in enumerate(provider_keys, 1):
+        p = IMAP_PROVIDERS[k]
+        print(f"    {i}. {p['label']} ({p['host']}:{p['port']})")
     print()
-    print(c("  → Get one: https://myaccount.google.com/apppasswords", Style.ITALIC))
+    provider_choice = input(c("  Select (1-3, default: 1): ", Style.BOLD)).strip()
+    if provider_choice == "2":
+        provider = "outlook"
+    elif provider_choice == "3":
+        provider = "hotmail"
+    else:
+        provider = "gmail"
+    provider_info = IMAP_PROVIDERS[provider]
+    print(c(f"  ✅  {provider_info['label']} selected!", Style.GREEN))
     print()
-    email_addr = input(c("  ✉️  Gmail address: ", Style.BOLD)).strip()
-    password = getpass.getpass(c("  🔑 16-char App Password: ", Style.BOLD)).strip()
-    print()
-    print(c("  ✅  Credentials saved!", Style.GREEN))
-    save_creds(email_addr, password)
     time.sleep(0.3)
 
-    # ── Step 2: Test connection ──
+    # ── Step 2: Credentials ──
+    print(c("  ── Step 2: Email Credentials ──", Style.CYAN, Style.BOLD))
     print()
-    print(c("  ── Step 2: Testing Connection ──", Style.CYAN, Style.BOLD))
+    print(f"  I'll watch your {provider_info['label']} inbox for verification codes.")
+    if provider == "gmail":
+        print("  You'll need a 16-character App Password (NOT your regular password).")
+        print()
+        print(c("  → Get one: https://myaccount.google.com/apppasswords", Style.ITALIC))
+    else:
+        print("  You'll need an App Password (NOT your regular password).")
+        print()
+        print(c("  → Get one: https://account.microsoft.com/security", Style.ITALIC))
+        print("     → Advanced security options → App passwords")
+    print()
+    email_addr = input(c(f"  ✉️  {provider_info['label']} email address: ", Style.BOLD)).strip()
+    password = getpass.getpass(c("  🔑  App Password: ", Style.BOLD)).strip()
+    print()
+    print(c("  ✅  Credentials saved!", Style.GREEN))
+    save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
+               provider=provider)
+    time.sleep(0.3)
+
+    # ── Step 3: Test connection ──
+    print()
+    print(c("  ── Step 3: Testing Connection ──", Style.CYAN, Style.BOLD))
     print()
     print(c("  Testing IMAP connection...", Style.DIM), end="", flush=True)
     try:
         con = connect({"email": email_addr, "password": password,
-                        "host": DEFAULT_IMAP[0], "port": DEFAULT_IMAP[1]})
+                        "host": provider_info["host"], "port": provider_info["port"]})
         con.logout()
         print(c(" ✅", Style.GREEN))
     except Exception as e:
@@ -1035,9 +1099,9 @@ def setup():
         return
     time.sleep(0.3)
 
-    # ── Step 3: Google Calendar ──
+    # ── Step 4: Google Calendar ──
     print()
-    print(c("  ── Step 3: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
+    print(c("  ── Step 4: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
     print()
     print("  I can also extract dates/times from emails (flights, appointments,")
     print("  reservations, meetings) and add them to your Google Calendar.")
@@ -1047,13 +1111,14 @@ def setup():
     if want_cal in ("y", "yes"):
         cal_ok = calendar_auth_flow()
         if cal_ok:
-            save_creds(email_addr, password, cal_token=True)
+            save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
+                       provider=provider, cal_token=True)
     else:
         print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
 
-    # ── Step 4: Clipboard ──
+    # ── Step 5: Clipboard ──
     print()
-    print(c("  ── Step 4: Clipboard Tool ──", Style.CYAN, Style.BOLD))
+    print(c("  ── Step 5: Clipboard Tool ──", Style.CYAN, Style.BOLD))
     print()
     clipboard_ok = False
     for cmd in ["wl-copy", "xclip", "pbcopy"]:
@@ -1075,14 +1140,37 @@ def setup():
             else:
                 print(c("  ✗  Installation failed. Install manually.", Style.RED))
 
+    # ── Step 6: Secure Mode ──
+    print()
+    print(c("  ── Step 6: Secure Mode (optional) ──", Style.CYAN, Style.BOLD))
+    print()
+    print("  Secure mode automatically erases the verification code from your")
+    print("  clipboard after a set amount of time. This prevents accidentally")
+    print("  leaving sensitive codes lying around.")
+    print()
+    want_secure = input(c("  🔒  Enable Secure Mode (auto-erase clipboard)? (y/N): ", Style.BOLD)).strip().lower()
+    secure_seconds = 0
+    if want_secure in ("y", "yes"):
+        sec = input(c("  ⏱️  Erase after how many seconds? (default: 30): ", Style.BOLD)).strip()
+        try:
+            secure_seconds = int(sec) if sec else 30
+        except ValueError:
+            secure_seconds = 30
+        print(c(f"  ✅  Secure mode: clipboard will be erased after {secure_seconds}s", Style.GREEN))
+        # Re-save with secure mode
+        save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
+                   provider=provider, cal_token=cal_ok, secure=True, secure_timeout=secure_seconds)
+
     # ── Summary ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
     print(c("  ╠══════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
-    print(c(f"  ║  ✉️  Gmail:       {email_addr[:30]:<30} ║", Style.GREEN))
+    print(c(f"  ║  ✉️  Provider:   {provider_info['label']:<15}         ║", Style.GREEN))
     print(c(f"  ║  📅  Calendar:    {'Connected' if cal_ok else 'Not set up':<30} ║", Style.GREEN))
     print(c(f"  ║  📋  Clipboard:   {'Ready' if clipboard_ok else 'Missing tool':<30} ║", Style.GREEN))
+    if secure_seconds > 0:
+        print(c(f"  ║  🔒  Secure:      {secure_seconds}s auto-erase        ║", Style.GREEN))
     print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print(c("  What now?", Style.BOLD))
@@ -1091,6 +1179,9 @@ def setup():
     print("  •  verify-code scan         — scan inbox for events with dates/times")
     print("  •  verify-code install      — auto-start on login + install to PATH")
     print("  •  verify-code auth         — (re-)auth Google Calendar")
+    print("  •  verify-code version      — show installed version")
+    if secure_seconds > 0:
+        print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
 
     # ── Step 5: Install to PATH ──
     print()
@@ -1157,10 +1248,25 @@ def run(args):
         return
 
     if res["code"]:
-        backend = copy_clipboard(res["code"])
+        # Check if secure mode is enabled in credentials
+        secure_timeout = 0
+        try:
+            creds_data = load_creds()
+            if creds_data.get("secure"):
+                secure_timeout = creds_data.get("secure_timeout", 30)
+        except Exception:
+            pass
+
+        if secure_timeout > 0:
+            backend = secure_copy_clipboard(res["code"], timeout=secure_timeout)
+            notify("verify-code", f"Copied code: {res['code']} (auto-erase in {secure_timeout}s)")
+            print(c(f"  📋  Copied verification code to clipboard ({backend}).", Style.GREEN, Style.BOLD))
+            print(c(f"  🔒  Auto-erase in {secure_timeout}s", Style.YELLOW))
+        else:
+            backend = copy_clipboard(res["code"])
+            notify("verify-code", f"Copied code: {res['code']} from {res['sender']}")
+            print(c(f"  📋  Copied verification code to clipboard ({backend}).", Style.GREEN, Style.BOLD))
         log_event(res["sender"], res["subject"], code=res["code"])
-        notify("verify-code", f"Copied code: {res['code']} from {res['sender']}")
-        print(c(f"  📋  Copied verification code to clipboard ({backend}).", Style.GREEN, Style.BOLD))
         print(f"  From:    {res['sender']}")
         print(f"  Subject: {res['subject']}")
         print(c(f"  Code:    {res['code']}", Style.CYAN, Style.BOLD))
@@ -1197,6 +1303,16 @@ def daemon_run(args):
 
     have_calendar = bool(get_calendar_service())
 
+    # Resolve secure timeout: CLI override > creds config > off
+    if args.secure_timeout > 0:
+        secure_timeout = args.secure_timeout
+    elif args.secure:
+        secure_timeout = creds.get("secure_timeout", 30)
+    elif creds.get("secure"):
+        secure_timeout = creds.get("secure_timeout", 30)
+    else:
+        secure_timeout = 0
+
     if not subprocess.run(["which", "wl-copy"], capture_output=True).returncode == 0:
         notify("verify-code", "wl-copy not found — install wl-clipboard for auto-copy.")
         print(c("WARNING: wl-copy missing; codes will be logged but not copied.", Style.YELLOW), file=sys.stderr)
@@ -1204,7 +1320,8 @@ def daemon_run(args):
     print(c(f"  🔐  verify-code daemon v{__version__} started", Style.CYAN, Style.BOLD))
     print(f"     Window: {args.minutes}m  |  Interval: {interval}s"
           f"  |  Known-senders: {'yes' if args.known_senders else 'no'}"
-          f"  |  Calendar: {'yes' if have_calendar else 'no'}")
+          f"  |  Calendar: {'yes' if have_calendar else 'no'}"
+          f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}")
     if have_calendar:
         print(f"     Calendar min confidence: {args.cal_threshold}%")
     print(f"     Last UID: {last_uid}", flush=True)
@@ -1241,12 +1358,18 @@ def daemon_run(args):
                             continue
 
                         try:
-                            copy_clipboard(res["code"])
+                            if secure_timeout > 0:
+                                secure_copy_clipboard(res["code"], timeout=secure_timeout)
+                                notify("Verification code copied ✅",
+                                       f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}\nAuto-erase in {secure_timeout}s")
+                            else:
+                                copy_clipboard(res["code"])
+                                notify("Verification code copied ✅",
+                                       f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}")
                             log_event(res["sender"], res["subject"], code=res["code"])
-                            notify("Verification code copied ✅",
-                                   f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}")
+                            secure_label = f" 🔒{secure_timeout}s" if secure_timeout > 0 else ""
                             print(c(f"  [{now_ts}] 📋 Copied {res['code']} from {res['sender']} "
-                                  f"({res['confidence']}%)", Style.GREEN), flush=True)
+                                  f"({res['confidence']}%){secure_label}", Style.GREEN), flush=True)
                         except RuntimeError as e:
                             print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
                             log_event(res["sender"], res["subject"], code=res["code"])
@@ -1366,6 +1489,19 @@ def install_service(args):
 
     # ── Install systemd service ──
     os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
+
+    # Check if secure mode was configured
+    secure_args = ""
+    try:
+        if os.path.exists(CRED_FILE):
+            with open(CRED_FILE) as f:
+                creds_data = json.load(f)
+            if creds_data.get("secure"):
+                timeout = creds_data.get("secure_timeout", 30)
+                secure_args = f" --secure --secure-timeout {timeout}"
+    except Exception:
+        pass
+
     service_content = f"""\
 [Unit]
 Description=verify-code v{version_str} — auto-copy codes, find events
@@ -1374,7 +1510,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={local_script} daemon --calendar
+ExecStart={local_script} daemon --calendar{secure_args}
 Restart=on-failure
 RestartSec=10
 Environment=DISPLAY=:0
@@ -1641,15 +1777,9 @@ def update_self():
     """Update verify-code to the latest version from GitHub."""
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║   🔄  Updating verify-code…              ║", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔄  Checking for updates…              ║", Style.CYAN, Style.BOLD))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
-
-    # Use timestamp cache buster to bypass GitHub CDN caching
-    cache_buster = f"?v={int(time.time())}"
-    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
-    local_script = os.path.expanduser("~/.local/bin/verify-code")
-    local_bin = os.path.expanduser("~/.local/bin")
 
     # Check for curl
     if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
@@ -1657,39 +1787,54 @@ def update_self():
         print("  Install it: sudo apt install curl")
         return
 
+    local_script = os.path.expanduser("~/.local/bin/verify-code")
+    local_bin = os.path.expanduser("~/.local/bin")
     os.makedirs(local_bin, exist_ok=True)
 
+    # Get the current version
+    current_version = __version__
+
+    # Download to a temp file first to check the version
+    cache_buster = f"?v={int(time.time())}"
+    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
+    tmp_script = local_script + ".tmp"
+
     try:
-        # Use # flag for progress bar, -L for redirects, -f for fail
-        # Let output flow to terminal so the user sees the bar
         result = subprocess.run(
-            ["curl", "-#", "-fL", "-o", local_script, url],
+            ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", tmp_script, url],
             capture_output=False, timeout=60
         )
         if result.returncode != 0:
             print(c(" ✗", Style.RED))
             print(c("  ✗  Download failed (curl error)", Style.RED))
             print()
-            print("  Try the one-liner instead:")
-            print(c("    curl -fL https://raw.githubusercontent.com/", Style.BOLD))
-            print(c("      aakashjabraham-hue/verify-code/main/verify-code \\", Style.BOLD))
-            print(c("      -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code", Style.BOLD))
+            for p in [tmp_script]:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
             return
 
-        os.chmod(local_script, 0o755)
-        print(c(" ✅  Downloaded!", Style.GREEN))
-
-        # Get the new version
+        # Read the new version
+        remote_version = "?"
         try:
-            with open(local_script) as f:
-                for line in f:
-                    if line.startswith("__version__"):
-                        new_ver = line.split('"')[1]
-                        break
+            for line in open(tmp_script):
+                if line.startswith("__version__"):
+                    remote_version = line.split('"')[1]
+                    break
         except Exception:
-            new_ver = "?"
+            pass
 
-        print(c(f"  ✅  Updated to version {new_ver}!", Style.GREEN, Style.BOLD))
+        if remote_version == current_version or remote_version == "?":
+            os.remove(tmp_script)
+            print(c(f"  ✅  You're already on the latest version ({current_version})!", Style.GREEN, Style.BOLD))
+            print()
+            return
+
+        # Install the new version
+        os.replace(tmp_script, local_script)
+        os.chmod(local_script, 0o755)
+        print(c(f"  ✅  Updated from {current_version} → {remote_version}!", Style.GREEN, Style.BOLD))
         print(f"  Saved to: {local_script}")
         print()
         print("  Run any command to use the new version. 🚀")
@@ -1697,9 +1842,19 @@ def update_self():
     except subprocess.TimeoutExpired:
         print(c(" ✗", Style.RED))
         print(c("  ✗  Download timed out. Check your internet connection.", Style.RED))
+        for p in [tmp_script]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
     except Exception as e:
         print(c(" ✗", Style.RED))
         print(c(f"  ✗  Update failed: {e}", Style.RED))
+        for p in [tmp_script]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1723,6 +1878,7 @@ Examples:
   verify-code auth               # (Re-)auth Google Calendar
   verify-code version            # Show version
   verify-code --version          # Show version (alternative)
+  verify-code daemon --secure --secure-timeout 15  # Daemon with auto-erase
 
 One-liner install:
   curl -fL https://raw.githubusercontent.com/
@@ -1747,6 +1903,10 @@ One-liner install:
                    help="enable Google Calendar integration")
     p.add_argument("--cal-threshold", type=int, default=50,
                    help="minimum confidence threshold for calendar events (default 50)")
+    p.add_argument("--secure", action="store_true",
+                   help="enable secure mode (auto-erase clipboard after timeout)")
+    p.add_argument("--secure-timeout", type=int, default=0,
+                   help="seconds before auto-erasing clipboard in secure mode (default: from config)")
     p.add_argument("--script-path", default=sys.argv[0],
                    help="path to this script (for install; auto-detected)")
     p.add_argument("--version", action="version", version=f"verify-code v{__version__}")
