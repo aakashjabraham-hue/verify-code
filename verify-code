@@ -9,6 +9,8 @@ Modes:
   verify-code install          Install systemd user service for auto-start on login.
   verify-code scan             Scan inbox for events with dates/times (no code copy).
   verify-code auth             (Re-)authenticate Google Calendar.
+  verify-code version          Show the installed version.
+  verify-code --version        Show the installed version (alternative).
 
 Safety:
   - BODY.PEEK so messages are NEVER marked read.
@@ -1337,28 +1339,34 @@ def scan_mode(args):
 
 
 def install_service(args):
-    """Install the systemd user service."""
-    os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
-    script_path = os.path.abspath(args.script_path)
-
-    # Also copy to ~/.local/bin if not already there
+    """Install: download latest, copy to ~/.local/bin, set up systemd, run setup wizard."""
     local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
-    if os.path.abspath(script_path) != os.path.abspath(local_script):
-        os.makedirs(local_bin, exist_ok=True)
-        with open(script_path) as f:
-            content = f.read()
-        with open(local_script, "w") as f:
-            f.write(content)
-        os.chmod(local_script, 0o755)
-        print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
-        if local_bin not in os.environ.get("PATH", ""):
-            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
-            print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
 
+    # ── Download the latest from GitHub (cache-busting) ──
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
+    print(c("  ║   Installing the latest version…         ║", Style.CYAN))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    version_str = download_latest()
+    if version_str is None:
+        return
+
+    # ── PATH check ──
+    if local_bin not in os.environ.get("PATH", ""):
+        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+        print(f"     source ~/.bashrc")
+        print()
+
+    # ── Install systemd service ──
+    os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
     service_content = f"""\
 [Unit]
-Description=verify-code v{__version__} — auto-copy codes, find events
+Description=verify-code v{version_str} — auto-copy codes, find events
 After=network-online.target
 Wants=network-online.target
 
@@ -1380,10 +1388,44 @@ WantedBy=default.target
     os.chmod(SERVICE_FILE, 0o644)
 
     print(c(f"  ✅  Installed: {SERVICE_FILE}", Style.GREEN, Style.BOLD))
+
+    # ── Ask: run setup? ──
+    ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
+    if ans != "n":
+        print()
+        print(c("  Launching setup wizard…", Style.CYAN))
+        print()
+        setup()
+        print()
+
+    # ── Ask: enable daemon? ──
+    ans = input(c("  🤖  Enable the 24/7 background daemon (auto-copy codes)? (Y/n): ", Style.BOLD)).strip().lower()
+    if ans != "n":
+        print()
+        if os.path.exists(CRED_FILE):
+            print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
+                           capture_output=True, timeout=10)
+            print(c(" ✅", Style.GREEN))
+            print()
+            print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
+            print("  Check: systemctl --user status verify-code")
+        else:
+            print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
+
+    # ── Summary ──
     print()
-    print("  To enable and start:")
-    print(c("    systemctl --user daemon-reload", Style.BOLD))
-    print(c("    systemctl --user enable --now verify-code", Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print()
+    print("  Quick commands:")
+    print("    verify-code                  # One-shot: copy latest code")
+    print("    verify-code daemon           # Run background daemon")
+    print("    verify-code update           # Update to latest version")
+    print("    verify-code version          # Show installed version")
     print()
     print("  To check status:")
     print("    systemctl --user status verify-code")
@@ -1472,24 +1514,21 @@ def uninstall():
     print(c("  verify-code has been removed. 👋", Style.CYAN, Style.BOLD))
 
 
-def self_install(script_path=None):
-    """Download the latest verify-code from GitHub and run the setup wizard."""
+def download_latest():
+    """Download the latest verify-code from GitHub to ~/.local/bin/verify-code.
+    Returns the version string on success, None on failure."""
     local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
     os.makedirs(local_bin, exist_ok=True)
 
-    # ── Banner ──
-    print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║   🔐  verify-code  v2.0                 ║", Style.CYAN, Style.BOLD))
-    print(c("  ║   Installing the latest version…         ║", Style.CYAN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
-    print()
+    local_bin = os.path.expanduser("~/.local/bin")
+    local_script = os.path.join(local_bin, "verify-code")
+    os.makedirs(local_bin, exist_ok=True)
 
     # ── Check curl ──
     if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
         print(c("  ✗  curl is required. Install it: sudo apt install curl", Style.RED))
-        return
+        return None
 
     # ── Download with progress bar ──
     # Use a timestamp cache buster to bypass GitHub's CDN caching
@@ -1504,7 +1543,7 @@ def self_install(script_path=None):
     if result.returncode != 0:
         print()
         print(c("  ✗  Download failed. Check your internet connection.", Style.RED))
-        return
+        return None
 
     os.chmod(local_script, 0o755)
     print()
@@ -1521,6 +1560,27 @@ def self_install(script_path=None):
 
     print(c(f"  ✅  Downloaded version {version_str} to {local_script}", Style.GREEN, Style.BOLD))
     print()
+
+    return version_str
+
+
+def self_install(script_path=None):
+    """Download the latest verify-code from GitHub and run the setup wizard."""
+    local_bin = os.path.expanduser("~/.local/bin")
+
+    # ── Banner ──
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
+    print(c("  ║   Installing the latest version…         ║", Style.CYAN))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    version_str = download_latest()
+    if version_str is None:
+        return
+
+    local_script = os.path.join(local_bin, "verify-code")
 
     # ── PATH check ──
     if local_bin not in os.environ.get("PATH", ""):
@@ -1659,7 +1719,8 @@ Examples:
   verify-code update             # Download the latest version from GitHub
   verify-code uninstall          # Remove everything (script, config, data)
   verify-code auth               # (Re-)auth Google Calendar
-  verify-code --version          # Show version
+  verify-code version            # Show version
+  verify-code --version          # Show version (alternative)
 
 One-liner install:
   curl -fL https://raw.githubusercontent.com/
@@ -1668,8 +1729,8 @@ One-liner install:
 """,
     )
     p.add_argument("cmd", nargs="?", default="run",
-                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth"],
-                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth")
+                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version"],
+                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version")
     p.add_argument("--minutes", type=int, default=10,
                    help="lookback window in minutes (default 10)")
     p.add_argument("--interval", type=int, default=15,
@@ -1709,6 +1770,8 @@ One-liner install:
     elif args.cmd == "auth":
         if calendar_auth_flow():
             print(c("  ✅  Calendar authorization complete!", Style.GREEN, Style.BOLD))
+    elif args.cmd == "version":
+        print(c(f"  verify-code v{__version__}", Style.GREEN, Style.BOLD))
     else:
         run(args)
 

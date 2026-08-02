@@ -66,6 +66,7 @@ verify-code update
 | `verify-code update` | Download the latest version from GitHub |
 | `verify-code uninstall` | Remove everything (script, config, data, service) |
 | `verify-code auth` | (Re-)authenticate Google Calendar |
+| `verify-code version` | Show the installed version |
 
 ## Options
 
