@@ -1492,11 +1492,13 @@ def self_install(script_path=None):
         return
 
     # ── Download with progress bar ──
-    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code"
+    # Use a timestamp cache buster to bypass GitHub's CDN caching
+    cache_buster = f"?v={int(time.time())}"
+    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     print(c("  🌐  Downloading from GitHub…", Style.BOLD))
     print()
     result = subprocess.run(
-        ["curl", "-#", "-fL", "-o", local_script, url],
+        ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", local_script, url],
         capture_output=False, timeout=60
     )
     if result.returncode != 0:
@@ -1581,7 +1583,9 @@ def update_self():
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
-    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code"
+    # Use timestamp cache buster to bypass GitHub CDN caching
+    cache_buster = f"?v={int(time.time())}"
+    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     local_script = os.path.expanduser("~/.local/bin/verify-code")
     local_bin = os.path.expanduser("~/.local/bin")
 
