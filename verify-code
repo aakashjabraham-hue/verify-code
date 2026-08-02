@@ -1489,46 +1489,53 @@ def self_install(script_path=None):
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
-    # Find the script source
+    # Find the script source — try multiple paths in case we were piped
     content = None
-    if script_path in ("-", "/dev/stdin", ""):
-        for candidate in [
-            os.path.expanduser("~/verify-code/verify-code"),
-            os.path.expanduser("~/.local/bin/verify-code"),
-            os.path.expanduser("~/.local/bin/verify-code.py"),
-        ]:
-            if os.path.exists(candidate):
-                with open(candidate) as f:
+    for try_path in [script_path,
+                     os.path.expanduser("~/.local/bin/verify-code"),
+                     os.path.expanduser("~/verify-code/verify-code")]:
+        if try_path and os.path.exists(try_path):
+            try:
+                with open(try_path) as f:
                     content = f.read()
+                script_path = try_path
                 break
-        if content is None:
-            print(c("  ⚠  Downloading latest version from GitHub...", Style.YELLOW))
-            print()
-            print(c("  Run this one-liner to download directly:", Style.BOLD))
-            print()
-            print(c("    curl -fL https://raw.githubusercontent.com/", Style.BOLD))
-            print(c("      aakashjabraham-hue/verify-code/main/verify-code \\", Style.BOLD))
-            print(c("      -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code", Style.BOLD))
-            print()
-            print(c("  Then run: verify-code setup", Style.CYAN, Style.BOLD))
-            return
-    else:
+            except (FileNotFoundError, IOError):
+                continue
+
+    if content is None:
+        # Nothing found locally — tell them to download first
+        print(c("  ⚠  verify-code not found on your system yet.", Style.YELLOW))
+        print()
+        print(c("  Run the one-liner to download and install automatically:", Style.BOLD))
+        print()
+        print(c("    curl -fL https://raw.githubusercontent.com/", Style.BOLD))
+        print(c("      aakashjabraham-hue/verify-code/main/verify-code \\", Style.BOLD))
+        print(c("      -o ~/.local/bin/verify-code \\", Style.BOLD))
+        print(c("      && chmod +x ~/.local/bin/verify-code \\", Style.BOLD))
+        print(c("      && ~/.local/bin/verify-code install", Style.BOLD))
+        print()
+        return
+
+    # ── Animate install steps ──
+    print(c("  📥  Installing verify-code to ~/.local/bin/…", Style.BOLD))
+    print()
+
+    steps = [
+        ("  Copying script…", lambda: (open(local_script, "w").write(content))),
+        ("  Setting permissions…", lambda: os.chmod(local_script, 0o755)),
+        ("  Verifying…", lambda: None),
+    ]
+
+    for label, action in steps:
+        print(c(label, Style.DIM), end="", flush=True)
         try:
-            with open(script_path) as f:
-                content = f.read()
-        except (FileNotFoundError, IOError):
-            print(c(f"  ✗  Can't find script at {script_path}", Style.RED))
+            action()
+            print(c(" ✅", Style.GREEN))
+        except Exception as e:
+            print(c(f" ✗  {e}", Style.RED))
             return
-
-    # ── Animate install ──
-    for step in ["Copying script…", "Setting permissions…", "Verifying…"]:
-        print(c(f"  {step}", Style.DIM), end="", flush=True)
-        time.sleep(0.3)
-        print(c(" ✅", Style.GREEN))
-
-    with open(local_script, "w") as f:
-        f.write(content)
-    os.chmod(local_script, 0o755)
+        time.sleep(0.2)
 
     print()
     print(c(f"  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
@@ -1709,11 +1716,8 @@ One-liner install:
     elif args.cmd == "daemon":
         daemon_run(args)
     elif args.cmd == "install":
-        # If running from piped stdin (curl | python3 - install), do self-install
-        if sys.argv[0] in ("-", "/dev/stdin"):
-            self_install()
-        else:
-            install_service(args)
+        # Full interactive install: copy to PATH + setup wizard + daemon prompt
+        self_install(args.script_path)
     elif args.cmd == "uninstall":
         uninstall()
     elif args.cmd == "scan":

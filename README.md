@@ -7,10 +7,9 @@ No more hunting through your inbox for that 2FA code. Verify-code watches your G
 ## One-Liner Install
 
 ```bash
-curl -fL https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code
+curl -fL https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code && ~/.local/bin/verify-code install
 
-# Then run the interactive setup wizard:
-verify-code setup
+# The setup wizard will launch automatically. Just follow the prompts!
 ```
 
 ## Quick Start
