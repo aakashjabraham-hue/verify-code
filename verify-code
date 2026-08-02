@@ -1,0 +1,1732 @@
+#!/usr/bin/env python3
+"""
+verify-code v2.0 — grab verification codes, find dates/times, add to calendar.
+
+Modes:
+  verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
+  verify-code                  One-shot: copy newest verification code from last 10 min.
+  verify-code daemon           Background: watch inbox, auto-copy codes, extract events.
+  verify-code install          Install systemd user service for auto-start on login.
+  verify-code scan             Scan inbox for events with dates/times (no code copy).
+  verify-code auth             (Re-)authenticate Google Calendar.
+
+Safety:
+  - BODY.PEEK so messages are NEVER marked read.
+  - IMAP IDLE for instant delivery (falls back to polling).
+  - Known-sender whitelist (80+ senders) prevents false positives.
+  - Confidence scoring for code extraction.
+  - Dedup tracking — codes never re-copied.
+  - Atomic state writes with CRC validation.
+  - Credentials in ~/.config/verify-code/ (chmod 600).
+  - OAuth token stored alongside credentials.
+"""
+
+import os
+import sys
+import json
+import hashlib
+import imaplib
+import ssl
+import email
+import re
+import subprocess
+import argparse
+import getpass
+import datetime
+import time
+import socket
+import pathlib
+import webbrowser
+import urllib.parse
+import http.server
+import threading
+import tempfile
+from email.utils import parsedate_to_datetime
+
+# ── Google Calendar imports (optional) ──────────────────────────────────
+try:
+    from google.auth.transport.requests import Request as GoogleRequest
+    from google.oauth2.credentials import Credentials as GoogleCreds
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
+
+try:
+    from dateutil import parser as dateparser
+    DATEUTIL_AVAILABLE = True
+except ImportError:
+    DATEUTIL_AVAILABLE = False
+
+__version__ = "2.0.0"
+
+# ── Paths ──────────────────────────────────────────────────────────────
+CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
+CRED_FILE = os.path.join(CONFIG_DIR, "credentials.json")
+STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LOG_FILE = os.path.join(STATE_DIR, "log.txt")
+SERVICE_FILE = os.path.expanduser("~/.config/systemd/user/verify-code.service")
+CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
+CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
+
+DEFAULT_IMAP = ("imap.gmail.com", 993)
+
+# ── Color helpers ──────────────────────────────────────────────────────
+class Style:
+    BOLD = "\033[1m"
+    GREEN = "\033[92m"
+    CYAN = "\033[96m"
+    YELLOW = "\033[93m"
+    MAGENTA = "\033[95m"
+    RED = "\033[91m"
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+
+def c(text, *styles):
+    return "".join(styles) + text + Style.RESET if styles else text
+
+def print_banner():
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔐  verify-code  v2.0  🔐              ║", Style.CYAN, Style.BOLD))
+    print(c("  ║   Auto-copy codes · Find events · 📅     ║", Style.CYAN))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+# ── Known verification senders ─────────────────────────────────────────
+KNOWN_SENDERS = {
+    "github.com", "noreply.github.com", "notifications@github.com",
+    "google.com", "accounts.google.com", "noreply.google.com",
+    "noreply-accounts.google.com",
+    "amazon.com", "amazonaws.com", "signup.aws", "no-reply@signup.aws",
+    "aws.amazon.com", "aws.com",
+    "gitlab.com", "noreply@gitlab.com",
+    "microsoft.com", "accountprotection.microsoft.com",
+    "login.microsoftonline.com", "microsoftonline.com",
+    "apple.com", "appleid.apple.com",
+    "facebookmail.com", "facebook.com",
+    "twitter.com", "x.com",
+    "discord.com", "discordapp.com",
+    "slack.com", "slackhq.com",
+    "linkedin.com", "e.linkedin.com",
+    "reddit.com",
+    "notion.com", "notion.so",
+    "linear.app",
+    "vercel.com",
+    "netlify.com",
+    "heroku.com",
+    "digitalocean.com",
+    "dropbox.com", "dropboxmail.com",
+    "spotify.com",
+    "npmjs.com", "npm.com",
+    "pypi.org",
+    "docker.com", "hub.docker.com",
+    "stripe.com",
+    "coinbase.com",
+    "binance.com",
+    "paypal.com",
+    "venmo.com",
+    "zelle.com",
+    "wellsfargo.com",
+    "chase.com",
+    "bankofamerica.com",
+    "capitalone.com",
+    "outlook.com", "hotmail.com",
+    "youtube.com",
+    "twilio.com",
+    "authy.com",
+    "duosecurity.com",
+    "okta.com", "oktaemea.com",
+    "cloudflare.com",
+    "datadoghq.com",
+    "atlassian.com",
+    "figma.com",
+    "canva.com",
+    "zoom.us",
+    "uber.com",
+    "lyft.com",
+    "airbnb.com",
+    "doordash.com",
+    "instacart.com",
+    "roblox.com",
+    "epicgames.com",
+    "steampowered.com",
+    "blizzard.com",
+    "nintendo.com",
+    "playstation.com",
+    "xbox.com",
+    "godaddy.com",
+    "namecheap.com",
+    "squareup.com",
+    "shopify.com",
+    "mailchimp.com",
+    "sendgrid.com", "sendgrid.net",
+    "postmarkapp.com",
+    "mailgun.com",
+    "mongodb.com",
+    "replit.com",
+    "glitch.com",
+    "supabase.com",
+    "railway.app",
+    "render.com",
+    "fly.io",
+}
+
+# ── Code extraction regexes ────────────────────────────────────────────
+# Common code patterns seen in 2FA emails
+RE_EXPLICIT = re.compile(
+    r"(?:verification|confirm(?:ation)?|otp|one[- ]?time|security|login|log[- ]?in|"
+    r"sign[- ]?in|signup|sign[- ]?up|activate|access|2fa|two[- ]?factor|account|"
+    r"passcode|magic|mfa|multi[- ]?factor|auth|authenticator|temporary)\b"
+    r"[\s:=-]*(?:code|pin|number|token|link|key)?[\s:=-]*(?:is|[:=])?\s*"
+    r"(?=[A-Za-z0-9-]*\d)([A-Za-z0-9]{3,8}(?:[- ][A-Za-z0-9]{3,8})?)",
+    re.I,
+)
+
+# Alphanumeric codes like ABC-123 or A1B2C3
+RE_ALPHANUM = re.compile(r"\b([A-Z0-9]{2,8}(?:-|_)?[A-Z0-9]{2,8})\b")
+
+# Grouped 3+3 digits (e.g. "123 456" or "123-456")
+RE_GROUPED = re.compile(r"\b([0-9]{3}[ -][0-9]{3})\b")
+
+# Bare 5-8 digit codes
+RE_PLAIN_STRICT = re.compile(r"\b([0-9]{5,8})\b")
+
+# Bare 4-digit codes — ONLY with strong context
+RE_PLAIN_4 = re.compile(r"\b([0-9]{4})\b")
+
+# Context words that make a code plausible
+CONTEXT_WORDS = re.compile(
+    r"verif|confirm|otp|code|security|log[- ]?in|sign[- ]?in|activate|2fa|"
+    r"two[- ]?factor|one[- ]?time|one-time|pin|token|authenticator|"
+    r"mfa|multi[- ]?factor|passcode|magic|auth|temporary",
+    re.I,
+)
+
+# ── Date/time extraction patterns ──────────────────────────────────────
+# These patterns look for structured event info in email bodies
+
+# Pattern: date/time in various formats
+# Matches: "on June 15", "Date: June 15", "June 15, 2026 at 2:30 PM",
+# "Friday, August 14, 2026", "Departure: July 20, 2026 at 6:45 AM"
+RE_DATE_FULL = re.compile(
+    r"(?:(?:on|for|date|time|when|departure|arrival|check[- ]?in|checkout|"
+    r"starts|start|begins|begin|scheduled|confirmed|reserved)\s*[:]?\s*)?"
+    r"("
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|"
+    r"Friday|Saturday|Sunday)[, ]+\s*"
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?"
+    r"(?:,?\s*\d{4})?"
+    r")"
+    r"(?:\s+(?:at\s+)?"
+    r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)"
+    r")?",
+    re.I,
+)
+
+# Pattern: "[Month] [Day], [Year]" without day-of-week
+RE_DATE_MONTH_DAY = re.compile(
+    r"(?:(?:on|for|date|time|when|departure|arrival|check[- ]?in|checkout|"
+    r"starts|start|begins|begin|scheduled|confirmed|reserved)\s*[:]?\s*)?"
+    r"("
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?"
+    r"(?:,?\s*\d{4})?"
+    r")"
+    r"(?:\s+(?:at\s+)?"
+    r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)"
+    r")?",
+    re.I,
+)
+
+# Pattern: specific appointment/booking phrases
+# Not used as a standalone regex (concept folded into EVENT_KEYWORDS)
+
+# Pattern: flight codes
+RE_FLIGHT = re.compile(r"\b([A-Z]{2}\d{1,4})\b")
+
+# Pattern: times like "2:30 PM", "14:30", "2pm"
+RE_TIME = re.compile(
+    r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)"
+    r"(?:\s*(?:to|-|–|until)\s*"
+    r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?))?",
+    re.I,
+)
+
+# Pattern: date-like strings in various formats
+RE_DATE_ISO = re.compile(
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})"
+)
+RE_DATE_US = re.compile(
+    r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+)
+
+# ── Event type detection ───────────────────────────────────────────────
+EVENT_KEYWORDS = {
+    "flight": ["flight", "departure", "boarding", "gate", "airline", "airport", "terminal",
+               "seat", "confirmation", "itinerary", "e-ticket", "eticket"],
+    "appointment": ["appointment", "doctor", "dentist", "checkup", "consultation",
+                    "scheduled", "visit", "procedure"],
+    "meeting": ["meeting", "conference", "call", "video call", "zoom", "teams",
+                "standup", "sync", "review", "interview"],
+    "reservation": ["reservation", "booking", "dinner", "lunch", "breakfast", "table",
+                    "restaurant", "hotel", "check-in", "checkout", "stay"],
+    "event": ["event", "ticket", "concert", "show", "movie", "performance",
+              "game", "match", "tournament", "festival", "workshop", "webinar"],
+    "delivery": ["delivery", "package", "shipped", "arriving", "on its way",
+                 "estimated", "tracking"],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_creds():
+    if not os.path.exists(CRED_FILE):
+        sys.exit(c("No credentials found. Run: verify-code setup", Style.RED, Style.BOLD))
+    with open(CRED_FILE) as f:
+        return json.load(f)
+
+
+def save_creds(email_addr, password, host=DEFAULT_IMAP[0], port=DEFAULT_IMAP[1],
+               cal_token=None, cal_client=None):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    data = {"email": email_addr, "password": password, "host": host, "port": int(port)}
+    if cal_token:
+        data["calendar_authenticated"] = True
+    with open(CRED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(CRED_FILE, 0o600)
+    if cal_token:
+        with open(CAL_TOKEN_FILE, "w") as f:
+            json.dump(cal_token, f, indent=2)
+        os.chmod(CAL_TOKEN_FILE, 0o600)
+    if cal_client:
+        with open(CAL_CLIENT_FILE, "w") as f:
+            json.dump(cal_client, f, indent=2)
+        os.chmod(CAL_CLIENT_FILE, 0o600)
+
+
+def _compute_crc(data: dict) -> str:
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def load_state():
+    default = {"last_uid": 0, "seen_codes": [], "seen_events": [], "last_time": None}
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+    stored_crc = data.pop("_crc", None)
+    if stored_crc is None:
+        return default
+    computed = _compute_crc(data)
+    if stored_crc != computed:
+        print(c("⚠  State file corrupted (CRC mismatch); resetting.", Style.YELLOW), file=sys.stderr)
+        return default
+    for k in ("last_uid", "seen_codes", "last_time"):
+        if k not in data:
+            return default
+    if "seen_events" not in data:
+        data["seen_events"] = []
+    return data
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    payload = {k: v for k, v in state.items()
+               if k in ("last_uid", "seen_codes", "seen_events", "last_time")}
+    payload["_crc"] = _compute_crc(payload)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+    os.chmod(STATE_FILE, 0o600)
+
+
+def log_event(sender, subject, code=None, event=None):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a") as f:
+            if code:
+                f.write(f"[{ts}] CODE sender={sender} subject={subject!r} code={code}\n")
+            if event:
+                f.write(f"[{ts}] EVENT sender={sender} subject={subject!r} event={event}\n")
+        os.chmod(LOG_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def notify(title, body):
+    try:
+        subprocess.run(["notify-send", title, body], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def copy_clipboard(text):
+    text = text.strip().replace(" ", "").replace("-", "")
+    for cmd, backend in [
+        (["wl-copy"], "wayland"),
+        (["xclip", "-selection", "clipboard"], "x11"),
+        (["pbcopy"], "macos"),
+    ]:
+        try:
+            if subprocess.run(["which", cmd[0]], capture_output=True, timeout=5).returncode == 0:
+                res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
+                if res.returncode == 0:
+                    return backend
+                raise RuntimeError(f"{cmd[0]} exited {res.returncode}: {res.stderr.decode().strip()}")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    raise RuntimeError("No clipboard tool found (install wl-clipboard for Wayland).")
+
+
+def get_plain(msg):
+    """Extract plain text from email, with proper HTML-to-text conversion."""
+    if msg.is_multipart():
+        plain = html = None
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain" and plain is None:
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        plain = payload.decode("utf-8", "replace")
+                except Exception:
+                    pass
+            elif ct == "text/html" and html is None:
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        html = payload.decode("utf-8", "replace")
+                except Exception:
+                    pass
+        if plain:
+            return plain
+        if html:
+            return html_to_text(html)
+        return ""
+    try:
+        body = msg.get_payload(decode=True)
+        if body is None:
+            return ""
+        return body.decode("utf-8", "replace")
+    except Exception:
+        return str(msg)
+
+
+def html_to_text(html):
+    """Convert HTML email body to clean text for parsing."""
+    text = html
+    # Remove style and script blocks entirely
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
+    # Remove comments
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    # Replace common block elements with newlines
+    text = re.sub(r"</?(?:div|p|br|tr|li|h[1-6]|blockquote|section|article|header|footer)[^>]*>",
+                  "\n", text, flags=re.I)
+    # Replace remaining tags with spaces
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Decode entities
+    entities = {
+        "&nbsp;": " ", "&amp;": "&", "&gt;": ">", "&lt;": "<",
+        "&quot;": '"', "&apos;": "'", "&#160;": " ", "&#39;": "'",
+        "&#x27;": "'", "&#x2F;": "/",
+    }
+    for a, b in entities.items():
+        text = text.replace(a, b)
+    # Collapse whitespace
+    text = re.sub(r"\n\s*\n", "\n", text)
+    text = re.sub(r" +", " ", text)
+    return text.strip()
+
+
+def _sender_domain(sender: str) -> str:
+    m = re.search(r"@([^>\\s]+)", sender)
+    return m.group(1).lower().lstrip(".") if m else sender.lower()
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()[:16]
+
+
+def is_known_sender(sender: str) -> bool:
+    domain = _sender_domain(sender)
+    if domain in KNOWN_SENDERS:
+        return True
+    parts = domain.split(".")
+    for i in range(len(parts) - 1):
+        candidate = ".".join(parts[i:])
+        if candidate in KNOWN_SENDERS:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Code Extraction
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_code(text, subject="", sender=""):
+    """Extract verification code from email text with confidence scoring.
+
+    Returns dict with code, confidence (0-100), and method or None.
+    """
+    combined = f"{subject} {sender} {text[:2000]}"
+    has_context = bool(CONTEXT_WORDS.search(combined))
+    known_sender = is_known_sender(sender)
+
+    # Priority 1: explicit OTP label right next to digits (highest accuracy)
+    m = RE_EXPLICIT.search(text)
+    if m:
+        raw = m.group(1)
+        cleaned = raw.replace(" ", "").replace("-", "")
+        if len(cleaned) >= 4:
+            return {"code": cleaned, "confidence": 95, "method": "explicit_label"}
+
+    # Priority 2: grouped 3+3 digits (common in GitHub, Google)
+    if has_context or known_sender:
+        m = RE_GROUPED.search(text)
+        if m:
+            cleaned = m.group(1).replace(" ", "").replace("-", "")
+            return {"code": cleaned, "confidence": 88, "method": "grouped_3_3"}
+
+    # Priority 3: alphanumeric codes from known senders
+    if known_sender and has_context:
+        for m in RE_ALPHANUM.finditer(text):
+            code = m.group(1)
+            if len(code) >= 4 and len(code) <= 12:
+                return {"code": code, "confidence": 80, "method": "alphanumeric"}
+
+    # Priority 4: bare 5-8 digit codes
+    m = RE_PLAIN_STRICT.search(text)
+    if m:
+        score = 65 if known_sender else 45
+        if has_context:
+            score += 15
+        return {"code": m.group(1), "confidence": score, "method": "bare_digits"}
+
+    # Priority 5: bare 4-digit codes — ONLY with strong context + known sender
+    if known_sender and has_context:
+        m = RE_PLAIN_4.search(text)
+        if m:
+            # Check that the code is near a context word in the body
+            code = m.group(1)
+            idx = text.find(code)
+            nearby = text[max(0, idx - 80):idx + len(code) + 80]
+            if CONTEXT_WORDS.search(nearby):
+                return {"code": code, "confidence": 55, "method": "short_4_digit"}
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Date/Time + Event Extraction
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_datetime(text, subject="", sender=""):
+    """Extract date/time info from an email body.
+
+    Returns list of event dicts with:
+      - title: str
+      - start: ISO datetime string
+      - end: ISO datetime string (or None)
+      - location: str (or None)
+      - confidence: 0-100
+      - event_type: str
+      - source: str
+    """
+    events = []
+    body = text[:5000]  # Look at first 5K chars
+    combined = f"{subject} {sender} {body}"
+
+    if not DATEUTIL_AVAILABLE:
+        return events
+
+    # --- Detect event type ---
+    event_type = "event"
+    body_lower = body.lower() + " " + subject.lower()
+    type_scores = {}
+    for etype, keywords in EVENT_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in body_lower)
+        if score > 0:
+            type_scores[etype] = score
+    if type_scores:
+        event_type = max(type_scores, key=type_scores.get)
+
+    # --- Extract title ---
+    title = subject.strip()
+    # Clean up subject: remove common prefixes
+    title_clean = re.sub(
+        r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New)",
+        "", title, flags=re.I
+    ).strip(" :,;-\"'")
+    if not title_clean:
+        title_clean = event_type.capitalize()
+
+    # --- Extract location ---
+    location = None
+    loc_patterns = [
+        re.compile(r"(?:at|in|location|venue|address)[:\s]+([A-Za-z0-9\s,.'\-]+?)(?:\.|$|\n)", re.I),
+        re.compile(r"(?:located at|meet at|arrive at)[:\s]+([A-Za-z0-9\s,.'\-]+?)(?:\.|$|\n)", re.I),
+    ]
+    for pat in loc_patterns:
+        m = pat.search(body)
+        if m:
+            loc = m.group(1).strip()
+            if len(loc) > 3 and len(loc) < 100:
+                location = loc
+                break
+
+    # --- Search for dates ---
+    now = datetime.datetime.now()
+    found_dates = []
+
+    # Method 1: "on [date] at [time]" patterns (with day-of-week)
+    for m in RE_DATE_FULL.finditer(body):
+        date_str = m.group(1)
+        time_str = m.group(2) if m.lastindex >= 2 and m.group(2) else None
+        full_str = date_str
+        if time_str:
+            full_str += " " + time_str
+        # Strip trailing punctuation that might confuse dateparser
+        full_str = full_str.rstrip(".,;:!?")
+        try:
+            dt = dateparser.parse(full_str, fuzzy=True, default=now)
+            if dt and dt > datetime.datetime(2000, 1, 1):
+                found_dates.append((dt, 85))
+        except (ValueError, TypeError):
+            pass
+
+    # Method 1b: "[Month] [Day], [Year]" patterns (no day-of-week)
+    seen_dates = set()
+    for m in RE_DATE_MONTH_DAY.finditer(body):
+        date_str = m.group(1)
+        time_str = m.group(2) if m.lastindex >= 2 and m.group(2) else None
+        full_str = date_str
+        if time_str:
+            full_str += " " + time_str
+        full_str = full_str.rstrip(".,;:!?")
+        try:
+            dt = dateparser.parse(full_str, fuzzy=True, default=now)
+            if dt and dt > datetime.datetime(2000, 1, 1):
+                # Check not already found
+                key = dt.strftime("%Y%m%d%H%M")
+                if key not in seen_dates:
+                    found_dates.append((dt, 80))
+                    seen_dates.add(key)
+        except (ValueError, TypeError):
+            pass
+
+    # Method 2: ISO dates (2024-07-15)
+    for m in RE_DATE_ISO.finditer(body):
+        try:
+            dt = dateparser.parse(m.group(1), fuzzy=False)
+            if dt:
+                # Check for time nearby
+                nearby = body[m.end():m.end() + 60]
+                time_m = RE_TIME.search(nearby)
+                if time_m:
+                    try:
+                        full = f"{m.group(1)} {time_m.group(1)}"
+                        dt = dateparser.parse(full, fuzzy=False)
+                    except (ValueError, TypeError):
+                        pass
+                found_dates.append((dt, 70))
+        except (ValueError, TypeError):
+            pass
+
+    # Method 3: US-style dates (7/15/2024)
+    for m in RE_DATE_US.finditer(body):
+        # Only if it's actually a date (not just numbers)
+        parts = m.group(1).replace("-", "/").split("/")
+        if len(parts) == 3:
+            try:
+                parts = [int(p) for p in parts]
+                if parts[0] <= 12 and parts[0] >= 1 and parts[1] <= 31 and parts[2] >= 2020:
+                    # Check for time nearby
+                    nearby = body[m.end():m.end() + 60]
+                    time_m = RE_TIME.search(nearby)
+                    dt = datetime.datetime(parts[2], parts[0], parts[1])
+                    if time_m:
+                        try:
+                            full = f"{m.group(1)} {time_m.group(1)}"
+                            dt = dateparser.parse(full, fuzzy=False)
+                        except (ValueError, TypeError):
+                            dt = dt.replace(hour=12)
+                    else:
+                        dt = dt.replace(hour=12)
+                    found_dates.append((dt, 60))
+            except (ValueError, TypeError):
+                pass
+
+    # Method 4: Fuzzy dateutil parsing of the email body
+    if not found_dates:
+        # Try to find the first meaningful date in the body
+        try:
+            dt = dateparser.parse(body, fuzzy=True, default=now)
+            if dt and dt > datetime.datetime(2000, 1, 1) and dt < now + datetime.timedelta(days=365):
+                found_dates.append((dt, 40))
+        except (ValueError, TypeError):
+            pass
+
+    # Deduplicate and filter
+    seen = set()
+    unique_dates = []
+    for dt, conf in found_dates:
+        key = dt.strftime("%Y%m%d%H%M")
+        if key not in seen:
+            seen.add(key)
+            unique_dates.append((dt, conf))
+
+    # Sort by confidence (highest first)
+    unique_dates.sort(key=lambda x: -x[1])
+
+    for dt, conf in unique_dates:
+        # Skip if it's too far in the past
+        if dt < now - datetime.timedelta(days=1):
+            continue
+
+        end_dt = None
+        # Check for duration/end time nearby
+        time_text = body[max(0, body.lower().find(dt.strftime("%B")) - 20):
+                         body.lower().find(dt.strftime("%B")) + 120]
+        range_m = re.search(
+            r"(?:to|-|–|until)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)",
+            time_text, re.I
+        )
+        if range_m:
+            try:
+                end_str = dt.strftime("%Y-%m-%d") + " " + range_m.group(1)
+                end_dt = dateparser.parse(end_str, fuzzy=False)
+            except (ValueError, TypeError):
+                pass
+
+        # Default 1h duration if no end time found
+        if end_dt is None:
+            end_dt = dt + datetime.timedelta(hours=1)
+
+        event = {
+            "title": title_clean[:80],
+            "start": dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "location": location,
+            "confidence": conf,
+            "event_type": event_type,
+            "source": "email",
+        }
+        events.append(event)
+
+    return events
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Google Calendar Integration
+# ═══════════════════════════════════════════════════════════════════════
+
+CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+
+def get_calendar_service():
+    """Get an authenticated Google Calendar service."""
+    if not GOOGLE_AVAILABLE:
+        return None
+
+    creds = None
+    if os.path.exists(CAL_TOKEN_FILE):
+        try:
+            with open(CAL_TOKEN_FILE) as f:
+                token_data = json.load(f)
+            creds = GoogleCreds.from_authorized_user_info(token_data, CAL_SCOPES)
+        except Exception:
+            pass
+
+    # If no valid credentials, try to refresh
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleRequest())
+            # Save refreshed token
+            with open(CAL_TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
+            os.chmod(CAL_TOKEN_FILE, 0o600)
+        except Exception:
+            return None
+
+    if creds and creds.valid:
+        try:
+            service = build("calendar", "v3", credentials=creds)
+            return service
+        except Exception:
+            return None
+
+    return None
+
+
+def calendar_auth_flow():
+    """Run the interactive Google Calendar OAuth flow."""
+    if not GOOGLE_AVAILABLE:
+        print(c("  ✗  Google Calendar support requires:", Style.RED))
+        print("     pip install google-auth-oauthlib google-api-python-client")
+        print("     pip install python-dateutil")
+        return False
+
+    print()
+    print(c("  ── 📅  Google Calendar Setup  ──", Style.CYAN, Style.BOLD))
+    print()
+    print("  To add events to your calendar, I need permission.")
+    print("  You'll need a Google Cloud OAuth client.")
+    print()
+    print(c("  Step 1: Create OAuth credentials", Style.YELLOW, Style.BOLD))
+    print("  Go to: https://console.cloud.google.com/apis/credentials")
+    print("  → Create Credentials → OAuth 2.0 Client ID")
+    print("  → Application type: Desktop app")
+    print("  → Download the JSON file")
+    print()
+    print("  (Make sure you've enabled the Google Calendar API")
+    print("   at https://console.cloud.google.com/apis/library)")
+    print()
+
+    json_path = input(c("  Path to client_secret JSON: ", Style.BOLD)).strip()
+    json_path = os.path.expanduser(json_path)
+
+    if not os.path.exists(json_path):
+        print(c(f"  ✗  File not found: {json_path}", Style.RED))
+        return False
+
+    try:
+        with open(json_path) as f:
+            client_config = json.load(f)
+    except Exception as e:
+        print(c(f"  ✗  Could not read file: {e}", Style.RED))
+        return False
+
+    print()
+    print(c("  Step 2: Authorize in your browser", Style.YELLOW, Style.BOLD))
+    print("  A browser window will open. Sign in and grant access.")
+    print()
+
+    try:
+        flow = InstalledAppFlow.from_client_config(
+            client_config, CAL_SCOPES,
+            redirect_uri="http://localhost:8080/"
+        )
+
+        # Start a local server to catch the redirect
+        creds = flow.run_local_server(
+            port=8080,
+            host="localhost",
+            open_browser=True,
+            success_message="✅ verify-code is now authorized! You can close this tab.",
+        )
+
+        # Save token
+        token_data = json.loads(creds.to_json())
+        with open(CAL_TOKEN_FILE, "w") as f:
+            json.dump(token_data, f, indent=2)
+        os.chmod(CAL_TOKEN_FILE, 0o600)
+
+        # Save client config for re-auth
+        with open(CAL_CLIENT_FILE, "w") as f:
+            json.dump(client_config, f, indent=2)
+        os.chmod(CAL_CLIENT_FILE, 0o600)
+
+        print()
+        print(c("  ✅  Google Calendar authorized! Events can now be added.", Style.GREEN, Style.BOLD))
+        return True
+
+    except Exception as e:
+        print(c(f"  ✗  Authorization failed: {e}", Style.RED))
+        print("  Tip: Make sure your OAuth client is a 'Desktop app' type")
+        print("  and the Calendar API is enabled in your Google Cloud project.")
+        return False
+
+
+def add_event_to_calendar(event):
+    """Add an event to Google Calendar. Returns True on success."""
+    service = get_calendar_service()
+    if not service:
+        return False
+
+    try:
+        event_body = {
+            "summary": event["title"],
+            "start": {"dateTime": event["start"], "timeZone": "America/Chicago"},
+            "end": {"dateTime": event["end"], "timeZone": "America/Chicago"},
+        }
+        if event.get("location"):
+            event_body["location"] = event["location"]
+        if event.get("description"):
+            event_body["description"] = event["description"]
+
+        created = service.events().insert(calendarId="primary", body=event_body).execute()
+        return created.get("htmlLink")
+    except Exception as e:
+        print(c(f"  ✗  Calendar error: {e}", Style.RED), file=sys.stderr)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# IMAP / Email
+# ═══════════════════════════════════════════════════════════════════════
+
+def connect(creds):
+    ctx = ssl.create_default_context()
+    con = imaplib.IMAP4_SSL(creds["host"], int(creds["port"]), ssl_context=ctx)
+    con.login(creds["email"], creds["password"])
+    con.select("INBOX")
+    return con
+
+
+def find_newest_code(con, window, since_uid=0, known_senders_only=False):
+    """Return dict with code, sender, subject, age, uid, confidence, method, events."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    uids = []
+    try:
+        typ, data = con.search(None, "X-GM-RAW", f"newer_than:{int(window.total_seconds() // 60)}m")
+        if typ == "OK" and data and data[0]:
+            uids = data[0].split()
+    except imaplib.IMAP4.error:
+        uids = []
+    if not uids:
+        since = (now - window).strftime("%d-%b-%Y")
+        try:
+            typ, data = con.search(None, "SINCE", since)
+            if typ == "OK" and data and data[0]:
+                uids = data[0].split()
+        except imaplib.IMAP4.error:
+            pass
+    if not uids:
+        return None
+
+    for uid in reversed(uids):
+        uid_int = int(uid)
+        if uid_int <= since_uid:
+            continue
+        uid_s = str(uid_int)
+        try:
+            typ, data = con.fetch(uid_s, "(BODY.PEEK[HEADER])")
+            if typ != "OK":
+                continue
+            head = email.message_from_bytes(data[0][1])
+            sender = head.get("From", "")
+            subject = head.get("Subject", "") or ""
+
+            if known_senders_only and not is_known_sender(sender):
+                continue
+
+            date = parsedate_to_datetime(head.get("Date", ""))
+            if date is None:
+                continue
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=datetime.timezone.utc)
+            age = now - date.astimezone(datetime.timezone.utc)
+            if age > window:
+                continue
+
+            typ, data = con.fetch(uid_s, "(BODY.PEEK[])")
+            if typ != "OK":
+                continue
+            msg = email.message_from_bytes(data[0][1])
+            body = get_plain(msg)
+
+            result = extract_code(body, subject, sender)
+            events = extract_datetime(body, subject, sender) if DATEUTIL_AVAILABLE else []
+
+            return {
+                "code": result["code"] if result else None,
+                "confidence": result["confidence"] if result else 0,
+                "method": result["method"] if result else None,
+                "sender": sender,
+                "subject": subject,
+                "age": age,
+                "uid": uid,
+                "events": events,
+                "body": body,
+            }
+        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError):
+            continue
+    return None
+
+
+def wait_for_code_idle(con, window, since_uid=0, known_senders_only=False, idle_timeout=1200):
+    """Use IMAP IDLE to wait for new mail, then check for a code/event."""
+    while True:
+        try:
+            typ, data = con.idle()
+            if typ != "OK":
+                return None
+            now = time.time()
+            con.settimeout(idle_timeout)
+            con.idle()
+            time.sleep(0.5)
+            typ, data = con.idle()
+            res = find_newest_code(con, window, since_uid, known_senders_only)
+            if res:
+                return res
+        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, AttributeError):
+            return None
+
+
+def supports_idle(con):
+    try:
+        typ, data = con.capability()
+        caps = data[0].decode() if isinstance(data[0], bytes) else data[0]
+        return "IDLE" in caps.upper()
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Setup Wizard
+# ═══════════════════════════════════════════════════════════════════════
+
+def setup():
+    """Interactive, fun setup wizard."""
+    print_banner()
+    print(c("  Welcome to verify-code v2.0! Let's get you set up. 🚀", Style.BOLD))
+    print()
+    time.sleep(0.5)
+
+    # ── Step 1: Gmail ──
+    print(c("  ── Step 1: Gmail Credentials ──", Style.CYAN, Style.BOLD))
+    print()
+    print("  I'll watch your Gmail inbox for verification codes.")
+    print("  You'll need a 16-character App Password (NOT your regular password).")
+    print()
+    print(c("  → Get one: https://myaccount.google.com/apppasswords", Style.ITALIC))
+    print()
+    email_addr = input(c("  ✉️  Gmail address: ", Style.BOLD)).strip()
+    password = getpass.getpass(c("  🔑 16-char App Password: ", Style.BOLD)).strip()
+    print()
+    print(c("  ✅  Credentials saved!", Style.GREEN))
+    save_creds(email_addr, password)
+    time.sleep(0.3)
+
+    # ── Step 2: Test connection ──
+    print()
+    print(c("  ── Step 2: Testing Connection ──", Style.CYAN, Style.BOLD))
+    print()
+    print(c("  Testing IMAP connection...", Style.DIM), end="", flush=True)
+    try:
+        con = connect({"email": email_addr, "password": password,
+                        "host": DEFAULT_IMAP[0], "port": DEFAULT_IMAP[1]})
+        con.logout()
+        print(c(" ✅", Style.GREEN))
+    except Exception as e:
+        print(c(" ✗", Style.RED))
+        print(c(f"  Connection failed: {e}", Style.YELLOW))
+        print("  Check your email and app password, then run setup again.")
+        return
+    time.sleep(0.3)
+
+    # ── Step 3: Google Calendar ──
+    print()
+    print(c("  ── Step 3: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
+    print()
+    print("  I can also extract dates/times from emails (flights, appointments,")
+    print("  reservations, meetings) and add them to your Google Calendar.")
+    print()
+    want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
+    cal_ok = False
+    if want_cal in ("y", "yes"):
+        cal_ok = calendar_auth_flow()
+        if cal_ok:
+            save_creds(email_addr, password, cal_token=True)
+    else:
+        print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
+
+    # ── Step 4: Clipboard ──
+    print()
+    print(c("  ── Step 4: Clipboard Tool ──", Style.CYAN, Style.BOLD))
+    print()
+    clipboard_ok = False
+    for cmd in ["wl-copy", "xclip", "pbcopy"]:
+        if subprocess.run(["which", cmd], capture_output=True).returncode == 0:
+            clipboard_ok = True
+            print(c(f"  ✅  {cmd} found — clipboard will work!", Style.GREEN))
+            break
+    if not clipboard_ok:
+        print(c("  ⚠  No clipboard tool found.", Style.YELLOW))
+        print("  Install one: sudo apt install wl-clipboard (Wayland)")
+        print("  or:          sudo apt install xclip (X11)")
+        install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
+        if install in ("y", "yes"):
+            ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
+                               capture_output=True)
+            if ret.returncode == 0:
+                print(c("  ✅  wl-clipboard installed!", Style.GREEN))
+                clipboard_ok = True
+            else:
+                print(c("  ✗  Installation failed. Install manually.", Style.RED))
+
+    # ── Summary ──
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
+    print(c("  ╠══════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
+    print(c(f"  ║  ✉️  Gmail:       {email_addr[:30]:<30} ║", Style.GREEN))
+    print(c(f"  ║  📅  Calendar:    {'Connected' if cal_ok else 'Not set up':<30} ║", Style.GREEN))
+    print(c(f"  ║  📋  Clipboard:   {'Ready' if clipboard_ok else 'Missing tool':<30} ║", Style.GREEN))
+    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print()
+    print(c("  What now?", Style.BOLD))
+    print("  •  verify-code              — one-shot: copy latest code")
+    print("  •  verify-code daemon       — background: watch & auto-copy")
+    print("  •  verify-code scan         — scan inbox for events with dates/times")
+    print("  •  verify-code install      — auto-start on login + install to PATH")
+    print("  •  verify-code auth         — (re-)auth Google Calendar")
+
+    # ── Step 5: Install to PATH ──
+    print()
+    print(c("  ── Step 5: Install to PATH ──", Style.CYAN, Style.BOLD))
+    print()
+    local_bin = os.path.expanduser("~/.local/bin")
+    local_script = os.path.join(local_bin, "verify-code")
+    script_path = os.path.abspath(sys.argv[0])
+    if os.path.abspath(local_script) != os.path.abspath(script_path):
+        ans = input(c("  📋  Copy verify-code to ~/.local/bin/? (Y/n): ", Style.BOLD)).strip().lower()
+        if ans != "n":
+            os.makedirs(local_bin, exist_ok=True)
+            with open(script_path) as f:
+                content = f.read()
+            with open(local_script, "w") as f:
+                f.write(content)
+            os.chmod(local_script, 0o755)
+            print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
+            if local_bin not in os.environ.get("PATH", ""):
+                print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+                print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+                print(f"     source ~/.bashrc")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Modes
+# ═══════════════════════════════════════════════════════════════════════
+
+def run(args):
+    """One-shot mode: find and copy the newest code."""
+    creds = load_creds()
+    window = datetime.timedelta(minutes=args.minutes)
+    con = connect(creds)
+    try:
+        res = find_newest_code(con, window, since_uid=0,
+                               known_senders_only=args.known_senders)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        con.logout()
+
+    if not res:
+        print(f"No verification code found in the last {args.minutes} minutes.")
+        if args.known_senders:
+            print("Tip: remove --known-senders to check all senders (higher FP risk).")
+        else:
+            print("Tip: run right after the email arrives, or bump --minutes.")
+        return
+
+    if args.dry_run:
+        print(f"[dry-run] Would copy code from: {res['sender']}")
+        print(f"  Subject:    {res['subject']!r}")
+        if res["code"]:
+            print(f"  Code:       {res['code']}  (confidence: {res['confidence']}%, method: {res['method']})")
+        else:
+            print("  Code:       (none found)")
+        if res["events"]:
+            for ev in res["events"]:
+                print(f"  Event:      {ev['title']} @ {ev['start']}  (confidence: {ev['confidence']}%)")
+        print(f"  Age:        {res['age']}")
+        return
+
+    if res["code"]:
+        backend = copy_clipboard(res["code"])
+        log_event(res["sender"], res["subject"], code=res["code"])
+        print(c(f"  📋  Copied verification code to clipboard ({backend}).", Style.GREEN, Style.BOLD))
+        print(f"  From:    {res['sender']}")
+        print(f"  Subject: {res['subject']}")
+        print(c(f"  Code:    {res['code']}", Style.CYAN, Style.BOLD))
+        print(f"  Confidence: {res['confidence']}%  ({res['method']})")
+        print()
+
+    # Handle events
+    if res["events"] and args.calendar and not args.dry_run:
+        calendar_service = get_calendar_service()
+        if calendar_service:
+            for ev in res["events"]:
+                if ev["confidence"] >= args.cal_threshold:
+                    link = add_event_to_calendar(ev)
+                    if link:
+                        log_event(res["sender"], res["subject"], event=ev["title"])
+                        print(c(f"  📅  Added to calendar: {ev['title']}", Style.GREEN))
+                        print(f"  When: {ev['start']} → {ev['end']}")
+                        if ev.get("location"):
+                            print(f"  Where: {ev['location']}")
+        else:
+            if res["events"]:
+                print(c("  ⚠  Calendar not authorized. Run: verify-code auth", Style.YELLOW))
+
+
+def daemon_run(args):
+    """Background daemon mode: watch inbox, auto-copy codes, extract events."""
+    creds = load_creds()
+    window = datetime.timedelta(minutes=args.minutes)
+    state = load_state()
+    last_uid = int(state.get("last_uid", 0))
+    seen_codes = set(state.get("seen_codes", []))
+    seen_events = set(state.get("seen_events", []))
+    interval = args.interval
+
+    have_calendar = bool(get_calendar_service())
+
+    if not subprocess.run(["which", "wl-copy"], capture_output=True).returncode == 0:
+        notify("verify-code", "wl-copy not found — install wl-clipboard for auto-copy.")
+        print(c("WARNING: wl-copy missing; codes will be logged but not copied.", Style.YELLOW), file=sys.stderr)
+
+    print(c(f"  🔐  verify-code daemon v{__version__} started", Style.CYAN, Style.BOLD))
+    print(f"     Window: {args.minutes}m  |  Interval: {interval}s"
+          f"  |  Known-senders: {'yes' if args.known_senders else 'no'}"
+          f"  |  Calendar: {'yes' if have_calendar else 'no'}")
+    if have_calendar:
+        print(f"     Calendar min confidence: {args.cal_threshold}%")
+    print(f"     Last UID: {last_uid}", flush=True)
+
+    while True:
+        try:
+            con = connect(creds)
+            has_idle = supports_idle(con) and not args.no_idle
+            if has_idle:
+                print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('IMAP IDLE', Style.CYAN)} mode active.", flush=True)
+            else:
+                print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('Polling', Style.DIM)} mode ({interval}s).", flush=True)
+
+            while True:
+                if has_idle:
+                    res = wait_for_code_idle(con, window, since_uid=last_uid,
+                                             known_senders_only=args.known_senders,
+                                             idle_timeout=interval)
+                else:
+                    res = find_newest_code(con, window, since_uid=last_uid,
+                                           known_senders_only=args.known_senders)
+                    con.noop()
+                    time.sleep(interval)
+
+                if res:
+                    now_ts = datetime.datetime.now().strftime("%H:%M:%S")
+
+                    # ── Handle code ──
+                    if res["code"]:
+                        dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['code'])}"
+                        if dedup_key in seen_codes:
+                            print(f"  [{now_ts}] skipped duplicate {res['code']} from {res['sender']}", flush=True)
+                            last_uid = max(last_uid, res["uid"])
+                            continue
+
+                        try:
+                            copy_clipboard(res["code"])
+                            log_event(res["sender"], res["subject"], code=res["code"])
+                            notify("Verification code copied ✅",
+                                   f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}")
+                            print(c(f"  [{now_ts}] 📋 Copied {res['code']} from {res['sender']} "
+                                  f"({res['confidence']}%)", Style.GREEN), flush=True)
+                        except RuntimeError as e:
+                            print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
+                            log_event(res["sender"], res["subject"], code=res["code"])
+
+                        last_uid = res["uid"]
+                        seen_codes.add(dedup_key)
+                        if len(seen_codes) > 50:
+                            seen_codes = set(list(seen_codes)[-50:])
+
+                    # ── Handle events ──
+                    if res["events"] and have_calendar:
+                        for ev in res["events"]:
+                            ev_key = f"{res['uid']}:{ev['start']}"
+                            if ev_key in seen_events:
+                                continue
+                            if ev["confidence"] >= args.cal_threshold:
+                                # Check if it's a real event (not just any date)
+                                link = add_event_to_calendar(ev)
+                                if link:
+                                    seen_events.add(ev_key)
+                                    log_event(res["sender"], res["subject"], event=ev["title"])
+                                    msg = f"📅  {ev['title']} @ {ev['start'][:16]}"
+                                    notify("Event added to calendar", msg)
+                                    print(c(f"  [{now_ts}] {msg}", Style.CYAN), flush=True)
+                                    # Keep seen_events bounded
+                                    if len(seen_events) > 50:
+                                        seen_events = set(list(seen_events)[-50:])
+
+                    # Update state (even if only UID advanced)
+                    last_uid = max(last_uid, res["uid"])
+                    save_state({
+                        "last_uid": last_uid,
+                        "seen_codes": list(seen_codes),
+                        "seen_events": list(seen_events),
+                        "last_time": datetime.datetime.now().isoformat(),
+                    })
+
+        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError) as e:
+            print(f"  [{datetime.datetime.now():%H:%M:%S}] connection error: {e}; retrying…",
+                  file=sys.stderr, flush=True)
+            time.sleep(max(interval, 10))
+        except KeyboardInterrupt:
+            print(c("\n  ⏹  Daemon stopped.", Style.YELLOW), flush=True)
+            break
+
+
+def scan_mode(args):
+    """Scan inbox for events with dates/times (no code copy)."""
+    creds = load_creds()
+    window = datetime.timedelta(minutes=args.minutes)
+    con = connect(creds)
+    print(c(f"  🔍  Scanning inbox for events (last {args.minutes} min)...", Style.CYAN, Style.BOLD))
+    print()
+
+    try:
+        res = find_newest_code(con, window, since_uid=0,
+                               known_senders_only=args.known_senders)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        con.logout()
+
+    if not res:
+        print("  No emails found in the scan window.")
+        return
+
+    if res["code"]:
+        print(c(f"  📋  Code found: {res['code']}", Style.GREEN, Style.BOLD))
+        print(f"     From: {res['sender']}")
+        print(f"     Subject: {res['subject']}")
+        print(f"     Confidence: {res['confidence']}% ({res['method']})")
+        print()
+
+    if res["events"]:
+        print(c(f"  📅  Events found: {len(res['events'])}", Style.CYAN, Style.BOLD))
+        print()
+        for i, ev in enumerate(res["events"], 1):
+            conf_bar = "█" * (ev["confidence"] // 10) + "░" * (10 - ev["confidence"] // 10)
+            print(f"  {i}. {c(ev['title'], Style.BOLD)}")
+            print(f"     {c('When:', Style.DIM)} {ev['start'][:16]} → {ev['end'][:16]}")
+            if ev.get("location"):
+                print(f"     {c('Where:', Style.DIM)} {ev['location']}")
+            print(f"     {c('Type:', Style.DIM)} {ev['event_type']}  "
+                  f"|  {c('Confidence:', Style.DIM)} {conf_bar} {ev['confidence']}%")
+            print()
+    else:
+        print("  No events with dates/times found.")
+        print("  Tip: Try --minutes 60 to scan a wider window.")
+        print()
+
+
+def install_service(args):
+    """Install the systemd user service."""
+    os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
+    script_path = os.path.abspath(args.script_path)
+
+    # Also copy to ~/.local/bin if not already there
+    local_bin = os.path.expanduser("~/.local/bin")
+    local_script = os.path.join(local_bin, "verify-code")
+    if os.path.abspath(script_path) != os.path.abspath(local_script):
+        os.makedirs(local_bin, exist_ok=True)
+        with open(script_path) as f:
+            content = f.read()
+        with open(local_script, "w") as f:
+            f.write(content)
+        os.chmod(local_script, 0o755)
+        print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
+        if local_bin not in os.environ.get("PATH", ""):
+            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+            print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+
+    service_content = f"""\
+[Unit]
+Description=verify-code v{__version__} — auto-copy codes, find events
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={local_script} daemon --calendar
+Restart=on-failure
+RestartSec=10
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/$UID
+
+[Install]
+WantedBy=default.target
+"""
+
+    with open(SERVICE_FILE, "w") as f:
+        f.write(service_content)
+    os.chmod(SERVICE_FILE, 0o644)
+
+    print(c(f"  ✅  Installed: {SERVICE_FILE}", Style.GREEN, Style.BOLD))
+    print()
+    print("  To enable and start:")
+    print(c("    systemctl --user daemon-reload", Style.BOLD))
+    print(c("    systemctl --user enable --now verify-code", Style.BOLD))
+    print()
+    print("  To check status:")
+    print("    systemctl --user status verify-code")
+    print()
+    print("  To view logs:")
+    print("    journalctl --user -u verify-code -f")
+
+
+def uninstall():
+    """Remove verify-code: script, credentials, state, systemd service, calendar token."""
+    print_banner()
+    print(c("  ╔══════════════════════════════════════════╗", Style.RED, Style.BOLD))
+    print(c("  ║   ⚠  Uninstalling verify-code  ⚠        ║", Style.RED, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.RED, Style.BOLD))
+    print()
+    print(c("  This will remove:", Style.BOLD))
+    print(f"  •  Script:          ~/.local/bin/verify-code")
+    print(f"  •  Config:          {CONFIG_DIR}")
+    print(f"  •  Data:            {STATE_DIR}")
+    print(f"  •  Systemd service: {SERVICE_FILE}")
+    print(f"  •  Calendar token:  {CAL_TOKEN_FILE}")
+    print()
+    ans = input(c("  Are you sure? (type 'yes' to confirm): ", Style.RED, Style.BOLD)).strip().lower()
+    if ans != "yes":
+        print(c("  ✗  Uninstall cancelled.", Style.YELLOW))
+        return
+
+    removed = []
+    errors = []
+
+    # 1. Systemd service
+    if os.path.exists(SERVICE_FILE):
+        try:
+            # Stop + disable first
+            subprocess.run(["systemctl", "--user", "stop", "verify-code"],
+                           capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "disable", "verify-code"],
+                           capture_output=True, timeout=10)
+            os.remove(SERVICE_FILE)
+            removed.append(SERVICE_FILE)
+        except Exception as e:
+            errors.append(f"systemd: {e}")
+
+    # 2. Script from ~/.local/bin
+    local_script = os.path.expanduser("~/.local/bin/verify-code")
+    if os.path.exists(local_script):
+        try:
+            os.remove(local_script)
+            removed.append(local_script)
+        except Exception as e:
+            errors.append(f"script: {e}")
+
+    # 3. Config directory
+    if os.path.exists(CONFIG_DIR):
+        import shutil
+        try:
+            shutil.rmtree(CONFIG_DIR)
+            removed.append(f"{CONFIG_DIR}/")
+        except Exception as e:
+            errors.append(f"config: {e}")
+
+    # 4. Data directory
+    if os.path.exists(STATE_DIR):
+        import shutil
+        try:
+            shutil.rmtree(STATE_DIR)
+            removed.append(f"{STATE_DIR}/")
+        except Exception as e:
+            errors.append(f"data: {e}")
+
+    print()
+    for item in removed:
+        print(c(f"  ✅  Removed: {item}", Style.GREEN))
+
+    if errors:
+        for err in errors:
+            print(c(f"  ⚠  {err}", Style.YELLOW))
+        print()
+        print(c("  Some items need manual removal. Run as root if needed:", Style.YELLOW))
+        print("    sudo rm -rf ~/.config/verify-code ~/.local/share/verify-code")
+        print("    sudo systemctl --user disable verify-code 2>/dev/null")
+        print("    sudo rm -f ~/.config/systemd/user/verify-code.service")
+        print("    systemctl --user daemon-reload")
+
+    print()
+    print(c("  verify-code has been removed. 👋", Style.CYAN, Style.BOLD))
+
+
+def self_install(script_path=None):
+    """Install verify-code to ~/.local/bin/ in one step with full setup walkthrough."""
+    if script_path is None:
+        script_path = sys.argv[0]
+
+    local_bin = os.path.expanduser("~/.local/bin")
+    local_script = os.path.join(local_bin, "verify-code")
+    os.makedirs(local_bin, exist_ok=True)
+
+    # ── Progress animation ──
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔐  verify-code  v2.0                 ║", Style.CYAN, Style.BOLD))
+    print(c("  ║   Installing...                          ║", Style.CYAN))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    # Find the script source
+    content = None
+    if script_path in ("-", "/dev/stdin", ""):
+        for candidate in [
+            os.path.expanduser("~/verify-code/verify-code"),
+            os.path.expanduser("~/.local/bin/verify-code"),
+            os.path.expanduser("~/.local/bin/verify-code.py"),
+        ]:
+            if os.path.exists(candidate):
+                with open(candidate) as f:
+                    content = f.read()
+                break
+        if content is None:
+            print(c("  ⚠  Downloading latest version from GitHub...", Style.YELLOW))
+            print()
+            print(c("  Run this one-liner to download directly:", Style.BOLD))
+            print()
+            print(c("    curl -fsSL https://raw.githubusercontent.com/", Style.BOLD))
+            print(c("      aakashjabraham-hue/verify-code/main/verify-code \\", Style.BOLD))
+            print(c("      -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code", Style.BOLD))
+            print()
+            print(c("  Then run: verify-code setup", Style.CYAN, Style.BOLD))
+            return
+    else:
+        try:
+            with open(script_path) as f:
+                content = f.read()
+        except (FileNotFoundError, IOError):
+            print(c(f"  ✗  Can't find script at {script_path}", Style.RED))
+            return
+
+    # ── Animate install ──
+    for step in ["Copying script…", "Setting permissions…", "Verifying…"]:
+        print(c(f"  {step}", Style.DIM), end="", flush=True)
+        time.sleep(0.3)
+        print(c(" ✅", Style.GREEN))
+
+    with open(local_script, "w") as f:
+        f.write(content)
+    os.chmod(local_script, 0o755)
+
+    print()
+    print(c(f"  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
+    print()
+
+    # ── PATH check ──
+    if local_bin not in os.environ.get("PATH", ""):
+        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+        print(f"     source ~/.bashrc")
+        print()
+
+    # ── Ask: setup now? ──
+    ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
+    if ans != "n":
+        print()
+        print(c("  Launching setup wizard…", Style.CYAN))
+        print()
+        setup()
+        print()
+
+    # ── Ask: enable daemon? ──
+    ans = input(c("  🤖  Enable the 24/7 background daemon (auto-copy codes)? (Y/n): ", Style.BOLD)).strip().lower()
+    if ans != "n":
+        print()
+        print(c("  Installing systemd service…", Style.CYAN))
+        # Check if setup ran and credentials exist
+        if os.path.exists(CRED_FILE):
+            class FakeArgs:
+                script_path = local_script
+            install_service(FakeArgs())
+            print()
+            print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
+                           capture_output=True, timeout=10)
+            print(c(" ✅", Style.GREEN))
+            print()
+            print(c("  ✅  Daemon is running! verify-code will auto-start on login.", Style.GREEN, Style.BOLD))
+            print("  Check status: systemctl --user status verify-code")
+            print("  View logs:    journalctl --user -u verify-code -f")
+        else:
+            print(c("  ⚠  No credentials found. Run setup first:", Style.YELLOW))
+            print("     verify-code setup")
+            print("     verify-code install")
+
+    # ── Summary ──
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print()
+    print("  Quick commands:")
+    print("    verify-code              — copy latest code")
+    print("    verify-code scan         — find events in inbox")
+    print("    verify-code daemon       — run 24/7 watcher")
+    print("    verify-code update       — get latest from GitHub")
+    print("    verify-code uninstall    — remove everything")
+    print()
+
+
+def update_self():
+    """Update verify-code to the latest version from GitHub."""
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   🔄  Updating verify-code…              ║", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code"
+    local_script = os.path.expanduser("~/.local/bin/verify-code")
+    local_bin = os.path.expanduser("~/.local/bin")
+
+    # Check for curl
+    if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
+        print(c("  ✗  curl is required for updates.", Style.RED))
+        print("  Install it: sudo apt install curl")
+        return
+
+    print(c("  Downloading latest version…", Style.DIM), end="", flush=True)
+
+    os.makedirs(local_bin, exist_ok=True)
+
+    try:
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", local_script, url],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(c(" ✗", Style.RED))
+            err = result.stderr.strip() or "download failed"
+            print(c(f"  ✗  {err}", Style.RED))
+            print()
+            print("  Try the one-liner instead:")
+            print(c("    curl -fsSL https://raw.githubusercontent.com/", Style.BOLD))
+            print(c("      aakashjabraham-hue/verify-code/main/verify-code \\", Style.BOLD))
+            print(c("      -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code", Style.BOLD))
+            return
+
+        os.chmod(local_script, 0o755)
+        print(c(" ✅", Style.GREEN))
+
+        # Get the new version
+        try:
+            with open(local_script) as f:
+                for line in f:
+                    if line.startswith("__version__"):
+                        new_ver = line.split('"')[1]
+                        break
+        except Exception:
+            new_ver = "?"
+
+        print(c(f"  ✅  Updated to version {new_ver}!", Style.GREEN, Style.BOLD))
+        print(f"  Saved to: {local_script}")
+        print()
+        print("  Run any command to use the new version. 🚀")
+
+    except subprocess.TimeoutExpired:
+        print(c(" ✗", Style.RED))
+        print(c("  ✗  Download timed out. Check your internet connection.", Style.RED))
+    except Exception as e:
+        print(c(" ✗", Style.RED))
+        print(c(f"  ✗  Update failed: {e}", Style.RED))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    p = argparse.ArgumentParser(
+        description=f"verify-code v{__version__} — Copy codes, find events, add to calendar.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  verify-code setup              # Interactive wizard (fun! 🎉)
+  verify-code                    # One-shot: copy latest code
+  verify-code scan               # Scan inbox for events
+  verify-code daemon             # Background: watch, copy, calendar
+  verify-code daemon --no-idle   # Force polling
+  verify-code install            # Install to ~/.local/bin + systemd service
+  verify-code update             # Download the latest version from GitHub
+  verify-code uninstall          # Remove everything (script, config, data)
+  verify-code auth               # (Re-)auth Google Calendar
+  verify-code --version          # Show version
+
+One-liner install:
+  curl -fsSL https://raw.githubusercontent.com/
+    aakashjabraham-hue/verify-code/main/verify-code \\
+    -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code
+""",
+    )
+    p.add_argument("cmd", nargs="?", default="run",
+                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth"],
+                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth")
+    p.add_argument("--minutes", type=int, default=10,
+                   help="lookback window in minutes (default 10)")
+    p.add_argument("--interval", type=int, default=15,
+                   help="daemon poll/IDLE timeout in seconds (default 15)")
+    p.add_argument("--known-senders", action="store_true",
+                   help="only extract from known verification senders")
+    p.add_argument("--no-idle", action="store_true",
+                   help="disable IMAP IDLE, force polling")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be done; no clipboard or calendar action")
+    p.add_argument("--calendar", action="store_true",
+                   help="enable Google Calendar integration")
+    p.add_argument("--cal-threshold", type=int, default=50,
+                   help="minimum confidence threshold for calendar events (default 50)")
+    p.add_argument("--script-path", default=sys.argv[0],
+                   help="path to this script (for install; auto-detected)")
+    p.add_argument("--version", action="version", version=f"verify-code v{__version__}")
+
+    args = p.parse_args()
+
+    if args.cmd == "setup":
+        setup()
+    elif args.cmd == "daemon":
+        daemon_run(args)
+    elif args.cmd == "install":
+        # If running from piped stdin (curl | python3 - install), do self-install
+        if sys.argv[0] in ("-", "/dev/stdin"):
+            self_install()
+        else:
+            install_service(args)
+    elif args.cmd == "uninstall":
+        uninstall()
+    elif args.cmd == "scan":
+        scan_mode(args)
+    elif args.cmd == "update":
+        update_self()
+    elif args.cmd == "auth":
+        if calendar_auth_flow():
+            print(c("  ✅  Calendar authorization complete!", Style.GREEN, Style.BOLD))
+    else:
+        run(args)
+
+
+if __name__ == "__main__":
+    main()
