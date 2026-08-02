@@ -391,10 +391,11 @@ def copy_clipboard(text):
                 res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
                 if res.returncode == 0:
                     return backend
-                raise RuntimeError(f"{cmd[0]} exited {res.returncode}: {res.stderr.decode().strip()}")
+                # Tool exists but failed (e.g. no Wayland socket) — try next backend
+                continue
         except (subprocess.TimeoutExpired, OSError):
             continue
-    raise RuntimeError("No clipboard tool found (install wl-clipboard for Wayland).")
+    raise RuntimeError("No clipboard tool worked (install wl-clipboard for Wayland or xclip for X11).")
 
 
 def get_plain(msg):
@@ -1158,6 +1159,7 @@ def run(args):
     if res["code"]:
         backend = copy_clipboard(res["code"])
         log_event(res["sender"], res["subject"], code=res["code"])
+        notify("verify-code", f"Copied code: {res['code']} from {res['sender']}")
         print(c(f"  📋  Copied verification code to clipboard ({backend}).", Style.GREEN, Style.BOLD))
         print(f"  From:    {res['sender']}")
         print(f"  Subject: {res['subject']}")
