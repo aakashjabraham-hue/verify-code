@@ -63,7 +63,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 # ── Paths ──────────────────────────────────────────────────────────────
 CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
