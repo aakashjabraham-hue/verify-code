@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify-code v2.1 — grab verification codes, find dates/times, add to calendar.
+verify-code v2.2 — grab verification codes, find dates/times, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
@@ -63,15 +63,44 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
+
+# ── Platform detection ────────────────────────────────────────────────
+IS_WINDOWS = sys.platform == "win32"
+
+def _which(name):
+    """Cross-platform: find an executable in PATH."""
+    cmd = ["where", name] if IS_WINDOWS else ["which", name]
+    return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
+
+def _chmod_600(path):
+    """Set restrictive permissions on a file. No-op on Windows."""
+    if not IS_WINDOWS:
+        os.chmod(path, 0o600)
+
+def _chmod_644(path):
+    """Set readable permissions on a file. No-op on Windows."""
+    if not IS_WINDOWS:
+        os.chmod(path, 0o644)
+
+def _chmod_755(path):
+    """Set executable permissions on a file. No-op on Windows."""
+    if not IS_WINDOWS:
+        os.chmod(path, 0o755)
 
 # ── Paths ──────────────────────────────────────────────────────────────
-CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
+if IS_WINDOWS:
+    appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    CONFIG_DIR = os.path.join(appdata, "verify-code")
+    STATE_DIR = os.path.join(appdata, "verify-code", "data")
+    SERVICE_FILE = None  # no systemd on Windows
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
+    STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
+    SERVICE_FILE = os.path.expanduser("~/.config/systemd/user/verify-code.service")
 CRED_FILE = os.path.join(CONFIG_DIR, "credentials.json")
-STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "log.txt")
-SERVICE_FILE = os.path.expanduser("~/.config/systemd/user/verify-code.service")
 CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
 CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
 
@@ -103,7 +132,7 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║         🔐  verify-code  v2.1  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║         🔐  verify-code  v2.2  🔐        ║", Style.CYAN, Style.BOLD))
     print(c("  ║    Auto-copy codes · Find events · 📅    ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
@@ -319,15 +348,15 @@ def save_creds(email_addr, password, host=DEFAULT_IMAP[0], port=DEFAULT_IMAP[1],
         data["calendar_authenticated"] = True
     with open(CRED_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    os.chmod(CRED_FILE, 0o600)
+    _chmod_600(CRED_FILE)
     if cal_token:
         with open(CAL_TOKEN_FILE, "w") as f:
             json.dump(cal_token, f, indent=2)
-        os.chmod(CAL_TOKEN_FILE, 0o600)
+        _chmod_600(CAL_TOKEN_FILE)
     if cal_client:
         with open(CAL_CLIENT_FILE, "w") as f:
             json.dump(cal_client, f, indent=2)
-        os.chmod(CAL_CLIENT_FILE, 0o600)
+        _chmod_600(CAL_CLIENT_FILE)
 
 
 def _compute_crc(data: dict) -> str:
@@ -368,7 +397,7 @@ def save_state(state):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, STATE_FILE)
-    os.chmod(STATE_FILE, 0o600)
+    _chmod_600(STATE_FILE)
 
 
 def log_event(sender, subject, code=None, event=None):
@@ -380,27 +409,52 @@ def log_event(sender, subject, code=None, event=None):
                 f.write(f"[{ts}] CODE sender={sender} subject={subject!r} code={code}\n")
             if event:
                 f.write(f"[{ts}] EVENT sender={sender} subject={subject!r} event={event}\n")
-        os.chmod(LOG_FILE, 0o600)
+        _chmod_600(LOG_FILE)
     except Exception:
         pass
 
 
 def notify(title, body):
-    try:
-        subprocess.run(["notify-send", title, body], capture_output=True, timeout=5)
-    except Exception:
-        pass
+    if IS_WINDOWS:
+        try:
+            # PowerShell toast notification
+            ps_script = f'''
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$textNodes = $template.GetElementsByTagName("text")
+$textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) > $null
+$textNodes.Item(1).AppendChild($template.CreateTextNode("{body.replace('"', "'")}")) > $null
+$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("verify-code").Show($toast)
+'''
+            subprocess.run(["powershell", "-Command", ps_script], capture_output=True, timeout=10)
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.run(["notify-send", title, body], capture_output=True, timeout=5)
+        except Exception:
+            pass
 
 
 def copy_clipboard(text):
     text = text.strip().replace(" ", "").replace("-", "")
     for cmd, backend in [
+        (["powershell", "-Command", "$input | Set-Clipboard"], "windows"),
         (["wl-copy"], "wayland"),
         (["xclip", "-selection", "clipboard"], "x11"),
         (["pbcopy"], "macos"),
     ]:
         try:
-            if subprocess.run(["which", cmd[0]], capture_output=True, timeout=5).returncode == 0:
+            if cmd[0] == "powershell":
+                if IS_WINDOWS:
+                    res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
+                    if res.returncode == 0:
+                        return backend
+                    continue
+                else:
+                    continue
+            if _which(cmd[0]):
                 res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
                 if res.returncode == 0:
                     return backend
@@ -408,14 +462,19 @@ def copy_clipboard(text):
                 continue
         except (subprocess.TimeoutExpired, OSError):
             continue
-    raise RuntimeError("No clipboard tool worked (install wl-clipboard for Wayland or xclip for X11).")
+    raise RuntimeError("No clipboard tool worked (install wl-clipboard for Wayland, xclip for X11, or use Windows).")
 
 
 def erase_clipboard():
     """Erase clipboard contents by copying empty/whitespace."""
-    for cmd in [["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]]:
+    for cmd in [["powershell", "-Command", "$input | Set-Clipboard"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]]:
         try:
-            if subprocess.run(["which", cmd[0]], capture_output=True, timeout=5).returncode == 0:
+            if cmd[0] == "powershell":
+                if IS_WINDOWS:
+                    subprocess.run(cmd, input=b" " * 20, capture_output=True, timeout=5)
+                    return
+                continue
+            if _which(cmd[0]):
                 subprocess.run(cmd, input=b" " * 20, capture_output=True, timeout=5)
                 return
         except (subprocess.TimeoutExpired, OSError):
@@ -800,7 +859,7 @@ def get_calendar_service():
             # Save refreshed token
             with open(CAL_TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
-            os.chmod(CAL_TOKEN_FILE, 0o600)
+            _chmod_600(CAL_TOKEN_FILE)
         except Exception:
             return None
 
@@ -875,12 +934,12 @@ def calendar_auth_flow():
         token_data = json.loads(creds.to_json())
         with open(CAL_TOKEN_FILE, "w") as f:
             json.dump(token_data, f, indent=2)
-        os.chmod(CAL_TOKEN_FILE, 0o600)
+        _chmod_600(CAL_TOKEN_FILE)
 
         # Save client config for re-auth
         with open(CAL_CLIENT_FILE, "w") as f:
             json.dump(client_config, f, indent=2)
-        os.chmod(CAL_CLIENT_FILE, 0o600)
+        _chmod_600(CAL_CLIENT_FILE)
 
         print()
         print(c("  ✅  Google Calendar authorized! Events can now be added.", Style.GREEN, Style.BOLD))
@@ -1035,7 +1094,7 @@ def supports_idle(con):
 def setup():
     """Interactive, fun setup wizard."""
     print_banner()
-    print(c("  Welcome to verify-code v2.0! Let's get you set up. 🚀", Style.BOLD))
+    print(c("  Welcome to verify-code v2.2! Let's get you set up. 🚀", Style.BOLD))
     print()
     time.sleep(0.5)
 
@@ -1067,38 +1126,51 @@ def setup():
             print("  I can also extract dates/times from emails (flights, appointments,")
             print("  reservations, meetings) and add them to your Google Calendar.")
             print()
-            want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
-            cal_ok = False
+            cal_ok = bool(os.path.exists(CAL_TOKEN_FILE) and get_calendar_service())
+            if cal_ok:
+                print(c("  ✅  Calendar already connected!", Style.GREEN))
+                want_cal = input(c("  📅  Change Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
+            else:
+                want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
             if want_cal in ("y", "yes"):
                 cal_ok = calendar_auth_flow()
                 if cal_ok:
                     save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                                provider=provider, cal_token=True)
             else:
-                print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
+                if cal_ok:
+                    print(c("  ✅  Keeping existing Calendar connection.", Style.GREEN))
+                else:
+                    print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
             # Jump to clipboard
             print()
             print(c("  ── Step 4: Clipboard Tool ──", Style.CYAN, Style.BOLD))
             print()
             clipboard_ok = False
             for cmd in ["wl-copy", "xclip", "pbcopy"]:
-                if subprocess.run(["which", cmd], capture_output=True).returncode == 0:
+                if _which(cmd):
                     clipboard_ok = True
                     print(c(f"  ✅  {cmd} found — clipboard will work!", Style.GREEN))
                     break
+            if not clipboard_ok and IS_WINDOWS:
+                clipboard_ok = True
+                print(c("  ✅  PowerShell clipboard (Set-Clipboard) available!", Style.GREEN))
             if not clipboard_ok:
                 print(c("  ⚠  No clipboard tool found.", Style.YELLOW))
-                print("  Install one: sudo apt install wl-clipboard (Wayland)")
-                print("  or:          sudo apt install xclip (X11)")
-                install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
-                if install in ("y", "yes"):
-                    ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
-                                       capture_output=True)
-                    if ret.returncode == 0:
-                        print(c("  ✅  wl-clipboard installed!", Style.GREEN))
-                        clipboard_ok = True
-                    else:
-                        print(c("  ✗  Installation failed. Install manually.", Style.RED))
+                if not IS_WINDOWS:
+                    print("  Install one: sudo apt install wl-clipboard (Wayland)")
+                    print("  or:          sudo apt install xclip (X11)")
+                    install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
+                    if install in ("y", "yes"):
+                        ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
+                                           capture_output=True)
+                        if ret.returncode == 0:
+                            print(c("  ✅  wl-clipboard installed!", Style.GREEN))
+                            clipboard_ok = True
+                        else:
+                            print(c("  ✗  Installation failed. Install manually.", Style.RED))
+                else:
+                    print("  On Windows, PowerShell Set-Clipboard is used automatically.")
             # Jump to secure mode
             print()
             print(c("  ── Step 5: Secure Mode (optional) ──", Style.CYAN, Style.BOLD))
@@ -1166,7 +1238,7 @@ def setup():
                         content = f.read()
                     with open(local_script, "w") as f:
                         f.write(content)
-                    os.chmod(local_script, 0o755)
+                    _chmod_755(local_script)
                     print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
                     if local_bin not in os.environ.get("PATH", ""):
                         print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
@@ -1242,15 +1314,22 @@ def setup():
     print("  I can also extract dates/times from emails (flights, appointments,")
     print("  reservations, meetings) and add them to your Google Calendar.")
     print()
-    want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
-    cal_ok = False
+    cal_ok = bool(os.path.exists(CAL_TOKEN_FILE) and get_calendar_service())
+    if cal_ok:
+        print(c("  ✅  Calendar already connected!", Style.GREEN))
+        want_cal = input(c("  📅  Change Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
+    else:
+        want_cal = input(c("  📅  Set up Calendar integration? (y/N): ", Style.BOLD)).strip().lower()
     if want_cal in ("y", "yes"):
         cal_ok = calendar_auth_flow()
         if cal_ok:
             save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                        provider=provider, cal_token=True)
     else:
-        print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
+        if cal_ok:
+            print(c("  ✅  Keeping existing Calendar connection.", Style.GREEN))
+        else:
+            print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
 
     # ── Step 5: Clipboard ──
     print()
@@ -1258,23 +1337,29 @@ def setup():
     print()
     clipboard_ok = False
     for cmd in ["wl-copy", "xclip", "pbcopy"]:
-        if subprocess.run(["which", cmd], capture_output=True).returncode == 0:
+        if _which(cmd):
             clipboard_ok = True
             print(c(f"  ✅  {cmd} found — clipboard will work!", Style.GREEN))
             break
+    if not clipboard_ok and IS_WINDOWS:
+        clipboard_ok = True
+        print(c("  ✅  PowerShell clipboard (Set-Clipboard) available!", Style.GREEN))
     if not clipboard_ok:
         print(c("  ⚠  No clipboard tool found.", Style.YELLOW))
-        print("  Install one: sudo apt install wl-clipboard (Wayland)")
-        print("  or:          sudo apt install xclip (X11)")
-        install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
-        if install in ("y", "yes"):
-            ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
-                               capture_output=True)
-            if ret.returncode == 0:
-                print(c("  ✅  wl-clipboard installed!", Style.GREEN))
-                clipboard_ok = True
-            else:
-                print(c("  ✗  Installation failed. Install manually.", Style.RED))
+        if not IS_WINDOWS:
+            print("  Install one: sudo apt install wl-clipboard (Wayland)")
+            print("  or:          sudo apt install xclip (X11)")
+            install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
+            if install in ("y", "yes"):
+                ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
+                                   capture_output=True)
+                if ret.returncode == 0:
+                    print(c("  ✅  wl-clipboard installed!", Style.GREEN))
+                    clipboard_ok = True
+                else:
+                    print(c("  ✗  Installation failed. Install manually.", Style.RED))
+        else:
+            print("  On Windows, PowerShell Set-Clipboard is used automatically.")
 
     # ── Step 6: Secure Mode ──
     print()
@@ -1334,7 +1419,7 @@ def setup():
                 content = f.read()
             with open(local_script, "w") as f:
                 f.write(content)
-            os.chmod(local_script, 0o755)
+            _chmod_755(local_script)
             print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
             if local_bin not in os.environ.get("PATH", ""):
                 print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
@@ -1449,7 +1534,7 @@ def daemon_run(args):
     else:
         secure_timeout = 0
 
-    if not subprocess.run(["which", "wl-copy"], capture_output=True).returncode == 0:
+    if not IS_WINDOWS and not _which("wl-copy"):
         notify("verify-code", "wl-copy not found — install wl-clipboard for auto-copy.")
         print(c("WARNING: wl-copy missing; codes will be logged but not copied.", Style.YELLOW), file=sys.stderr)
 
@@ -1600,9 +1685,14 @@ def scan_mode(args):
 
 
 def install_service(args):
-    """Install: download latest, copy to ~/.local/bin, set up systemd, run setup wizard."""
-    local_bin = os.path.expanduser("~/.local/bin")
+    """Install: download latest, copy to PATH, set up auto-start, run setup wizard."""
+    if IS_WINDOWS:
+        local_bin = os.path.expanduser("~\\AppData\\Local\\Programs")
+    else:
+        local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
+    if IS_WINDOWS:
+        local_script += ".py"
 
     # ── Download the latest from GitHub (cache-busting) ──
     print()
@@ -1618,27 +1708,33 @@ def install_service(args):
 
     # ── PATH check ──
     if local_bin not in os.environ.get("PATH", ""):
-        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
-        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
-        print(f"     source ~/.bashrc")
+        if IS_WINDOWS:
+            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+            print(f"     setx PATH \"%PATH%;{local_bin}\"")
+            print("     (Restart your terminal)")
+        else:
+            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+            print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+            print(f"     source ~/.bashrc")
         print()
 
-    # ── Install systemd service ──
-    os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
+    # ── Install auto-start service (systemd on Linux, task scheduler on Windows) ──
+    if not IS_WINDOWS and SERVICE_FILE:
+        os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
 
-    # Check if secure mode was configured
-    secure_args = ""
-    try:
-        if os.path.exists(CRED_FILE):
-            with open(CRED_FILE) as f:
-                creds_data = json.load(f)
-            if creds_data.get("secure"):
-                timeout = creds_data.get("secure_timeout", 30)
-                secure_args = f" --secure --secure-timeout {timeout}"
-    except Exception:
-        pass
+        # Check if secure mode was configured
+        secure_args = ""
+        try:
+            if os.path.exists(CRED_FILE):
+                with open(CRED_FILE) as f:
+                    creds_data = json.load(f)
+                if creds_data.get("secure"):
+                    timeout = creds_data.get("secure_timeout", 30)
+                    secure_args = f" --secure --secure-timeout {timeout}"
+        except Exception:
+            pass
 
-    service_content = f"""\
+        service_content = f"""\
 [Unit]
 Description=verify-code v{version_str} — auto-copy codes, find events
 After=network-online.target
@@ -1657,11 +1753,14 @@ Environment=XDG_RUNTIME_DIR=/run/user/$UID
 WantedBy=default.target
 """
 
-    with open(SERVICE_FILE, "w") as f:
-        f.write(service_content)
-    os.chmod(SERVICE_FILE, 0o644)
+        with open(SERVICE_FILE, "w") as f:
+            f.write(service_content)
+        _chmod_644(SERVICE_FILE)
 
-    print(c(f"  ✅  Installed: {SERVICE_FILE}", Style.GREEN, Style.BOLD))
+        print(c(f"  ✅  Installed: {SERVICE_FILE}", Style.GREEN, Style.BOLD))
+    elif IS_WINDOWS:
+        print(c("  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
+        print(c("  ⚡  On Windows, add to Task Scheduler or startup folder for auto-start.", Style.YELLOW))
 
     # ── Ask: run setup? ──
     ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
@@ -1677,15 +1776,20 @@ WantedBy=default.target
     if ans != "n":
         print()
         if os.path.exists(CRED_FILE):
-            print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
-            subprocess.run(["systemctl", "--user", "daemon-reload"],
-                           capture_output=True, timeout=10)
-            subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
-                           capture_output=True, timeout=10)
-            print(c(" ✅", Style.GREEN))
-            print()
-            print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
-            print("  Check: systemctl --user status verify-code")
+            if IS_WINDOWS:
+                print(c("  ⚡  On Windows, add verify-code to Task Scheduler for auto-start:", Style.YELLOW))
+                print(f"     schtasks /create /tn \"verify-code\" /tr \"python {local_script} daemon\" /sc onlogon /ru %USERNAME%")
+                print()
+            else:
+                print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
+                subprocess.run(["systemctl", "--user", "daemon-reload"],
+                               capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
+                               capture_output=True, timeout=10)
+                print(c(" ✅", Style.GREEN))
+                print()
+                print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
+                print("  Check: systemctl --user status verify-code")
         else:
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
@@ -1701,25 +1805,30 @@ WantedBy=default.target
     print("    verify-code update           # Update to latest version")
     print("    verify-code version          # Show installed version")
     print()
-    print("  To check status:")
-    print("    systemctl --user status verify-code")
-    print()
-    print("  To view logs:")
-    print("    journalctl --user -u verify-code -f")
+    if not IS_WINDOWS:
+        print("  To check status:")
+        print("    systemctl --user status verify-code")
+        print()
+        print("  To view logs:")
+        print("    journalctl --user -u verify-code -f")
 
 
 def uninstall():
-    """Remove verify-code: script, credentials, state, systemd service, calendar token."""
+    """Remove verify-code: script, credentials, state, service, calendar token."""
     print_banner()
     print(c("  ╔══════════════════════════════════════════╗", Style.RED, Style.BOLD))
     print(c("  ║   ⚠  Uninstalling verify-code  ⚠        ║", Style.RED, Style.BOLD))
     print(c("  ╚══════════════════════════════════════════╝", Style.RED, Style.BOLD))
     print()
     print(c("  This will remove:", Style.BOLD))
-    print(f"  •  Script:          ~/.local/bin/verify-code")
+    if IS_WINDOWS:
+        print(f"  •  Script:          {CONFIG_DIR}\\verify-code.py")
+    else:
+        print(f"  •  Script:          ~/.local/bin/verify-code")
     print(f"  •  Config:          {CONFIG_DIR}")
     print(f"  •  Data:            {STATE_DIR}")
-    print(f"  •  Systemd service: {SERVICE_FILE}")
+    if not IS_WINDOWS and SERVICE_FILE:
+        print(f"  •  Systemd service: {SERVICE_FILE}")
     print(f"  •  Calendar token:  {CAL_TOKEN_FILE}")
     print()
     ans = input(c("  Are you sure? (type 'yes' to confirm): ", Style.RED, Style.BOLD)).strip().lower()
@@ -1730,10 +1839,9 @@ def uninstall():
     removed = []
     errors = []
 
-    # 1. Systemd service
-    if os.path.exists(SERVICE_FILE):
+    # 1. Systemd service (Linux only)
+    if not IS_WINDOWS and SERVICE_FILE and os.path.exists(SERVICE_FILE):
         try:
-            # Stop + disable first
             subprocess.run(["systemctl", "--user", "stop", "verify-code"],
                            capture_output=True, timeout=10)
             subprocess.run(["systemctl", "--user", "disable", "verify-code"],
@@ -1743,8 +1851,11 @@ def uninstall():
         except Exception as e:
             errors.append(f"systemd: {e}")
 
-    # 2. Script from ~/.local/bin
-    local_script = os.path.expanduser("~/.local/bin/verify-code")
+    # 2. Script from path
+    if IS_WINDOWS:
+        local_script = os.path.join(CONFIG_DIR, "verify-code.py")
+    else:
+        local_script = os.path.expanduser("~/.local/bin/verify-code")
     if os.path.exists(local_script):
         try:
             os.remove(local_script)
@@ -1778,48 +1889,59 @@ def uninstall():
         for err in errors:
             print(c(f"  ⚠  {err}", Style.YELLOW))
         print()
-        print(c("  Some items need manual removal. Run as root if needed:", Style.YELLOW))
-        print("    sudo rm -rf ~/.config/verify-code ~/.local/share/verify-code")
-        print("    sudo systemctl --user disable verify-code 2>/dev/null")
-        print("    sudo rm -f ~/.config/systemd/user/verify-code.service")
-        print("    systemctl --user daemon-reload")
+        if IS_WINDOWS:
+            print(c("  Some items need manual removal:", Style.YELLOW))
+            print(f"    rm -rf {CONFIG_DIR}")
+        else:
+            print(c("  Some items need manual removal. Run as root if needed:", Style.YELLOW))
+            print("    sudo rm -rf ~/.config/verify-code ~/.local/share/verify-code")
+            if not IS_WINDOWS and SERVICE_FILE:
+                print("    sudo systemctl --user disable verify-code 2>/dev/null")
+                print("    sudo rm -f ~/.config/systemd/user/verify-code.service")
+                print("    systemctl --user daemon-reload")
 
     print()
     print(c("  verify-code has been removed. 👋", Style.CYAN, Style.BOLD))
 
 
 def download_latest():
-    """Download the latest verify-code from GitHub to ~/.local/bin/verify-code.
+    """Download the latest verify-code from GitHub to the install path.
     Returns the version string on success, None on failure."""
-    local_bin = os.path.expanduser("~/.local/bin")
-    local_script = os.path.join(local_bin, "verify-code")
+    if IS_WINDOWS:
+        local_bin = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code")
+        local_script = os.path.join(local_bin, "verify-code.py")
+    else:
+        local_bin = os.path.expanduser("~/.local/bin")
+        local_script = os.path.join(local_bin, "verify-code")
     os.makedirs(local_bin, exist_ok=True)
 
-    local_bin = os.path.expanduser("~/.local/bin")
-    local_script = os.path.join(local_bin, "verify-code")
-    os.makedirs(local_bin, exist_ok=True)
-
-    # ── Check curl ──
-    if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
+    # ── Check curl / PowerShell ──
+    if not _which("curl") and not IS_WINDOWS:
         print(c("  ✗  curl is required. Install it: sudo apt install curl", Style.RED))
         return None
 
     # ── Download with progress bar ──
-    # Use a timestamp cache buster to bypass GitHub's CDN caching
     cache_buster = f"?v={int(time.time())}"
     url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     print(c("  🌐  Downloading from GitHub…", Style.BOLD))
     print()
-    result = subprocess.run(
-        ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", local_script, url],
-        capture_output=False, timeout=60
-    )
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ["powershell", "-Command",
+             f"Invoke-WebRequest -Uri '{url}' -OutFile '{local_script}' -UseBasicParsing"],
+            capture_output=False, timeout=60
+        )
+    else:
+        result = subprocess.run(
+            ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", local_script, url],
+            capture_output=False, timeout=60
+        )
     if result.returncode != 0:
         print()
         print(c("  ✗  Download failed. Check your internet connection.", Style.RED))
         return None
 
-    os.chmod(local_script, 0o755)
+    _chmod_755(local_script)
     print()
 
     # ── Read version ──
@@ -1854,13 +1976,22 @@ def self_install(script_path=None):
     if version_str is None:
         return
 
-    local_script = os.path.join(local_bin, "verify-code")
+    if IS_WINDOWS:
+        local_bin = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code")
+        local_script = os.path.join(local_bin, "verify-code.py")
+    else:
+        local_script = os.path.join(local_bin, "verify-code")
 
     # ── PATH check ──
     if local_bin not in os.environ.get("PATH", ""):
-        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
-        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
-        print(f"     source ~/.bashrc")
+        if IS_WINDOWS:
+            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+            print(f"     setx PATH \"%PATH%;{local_bin}\"")
+            print("     (Restart your terminal)")
+        else:
+            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+            print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+            print(f"     source ~/.bashrc")
         print()
 
     # ── Ask: run setup? ──
@@ -1882,15 +2013,18 @@ def self_install(script_path=None):
                 script_path = local_script
             install_service(FakeArgs())
             print()
-            print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
-            subprocess.run(["systemctl", "--user", "daemon-reload"],
-                           capture_output=True, timeout=10)
-            subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
-                           capture_output=True, timeout=10)
-            print(c(" ✅", Style.GREEN))
-            print()
-            print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
-            print("  Check: systemctl --user status verify-code")
+            if IS_WINDOWS:
+                print(c("  ⚡  On Windows, add to Task Scheduler for auto-start.", Style.YELLOW))
+            else:
+                print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
+                subprocess.run(["systemctl", "--user", "daemon-reload"],
+                               capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
+                               capture_output=True, timeout=10)
+                print(c(" ✅", Style.GREEN))
+                print()
+                print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
+                print("  Check: systemctl --user status verify-code")
         else:
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
@@ -1917,29 +2051,38 @@ def update_self():
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
-    # Check for curl
-    if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
+    # Check for curl / PowerShell
+    if not _which("curl") and not IS_WINDOWS:
         print(c("  ✗  curl is required for updates.", Style.RED))
         print("  Install it: sudo apt install curl")
         return
 
-    local_script = os.path.expanduser("~/.local/bin/verify-code")
-    local_bin = os.path.expanduser("~/.local/bin")
-    os.makedirs(local_bin, exist_ok=True)
-
-    # Get the current version
     current_version = __version__
 
     # Download to a temp file first to check the version
     cache_buster = f"?v={int(time.time())}"
     url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
+    if IS_WINDOWS:
+        local_script = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code", "verify-code.py")
+        local_bin = os.path.dirname(local_script)
+    else:
+        local_script = os.path.expanduser("~/.local/bin/verify-code")
+        local_bin = os.path.expanduser("~/.local/bin")
+    os.makedirs(local_bin, exist_ok=True)
     tmp_script = local_script + ".tmp"
 
     try:
-        result = subprocess.run(
-            ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", tmp_script, url],
-            capture_output=False, timeout=60
-        )
+        if IS_WINDOWS:
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 f"Invoke-WebRequest -Uri '{url}' -OutFile '{tmp_script}' -UseBasicParsing"],
+                capture_output=False, timeout=60
+            )
+        else:
+            result = subprocess.run(
+                ["curl", "-#", "-fL", "-H", "Cache-Control: no-cache", "-o", tmp_script, url],
+                capture_output=False, timeout=60
+            )
         if result.returncode != 0:
             print(c(" ✗", Style.RED))
             print(c("  ✗  Download failed (curl error)", Style.RED))
@@ -1969,7 +2112,7 @@ def update_self():
 
         # Install the new version
         os.replace(tmp_script, local_script)
-        os.chmod(local_script, 0o755)
+        _chmod_755(local_script)
         print(c(f"  ✅  Updated from {current_version} → {remote_version}!", Style.GREEN, Style.BOLD))
         print(f"  Saved to: {local_script}")
         print()

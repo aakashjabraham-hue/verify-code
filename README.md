@@ -1,12 +1,13 @@
 # verify-code 🔐 → 📅
 
-**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar.** Supports **Gmail, Outlook, and Hotmail**.
+**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar.** Supports **Gmail, Outlook, and Hotmail** on **Linux, Windows, and macOS**.
 
 No more hunting through your inbox for that 2FA code. Verify-code watches your inbox (via IMAP), extracts verification codes, and copies them to your clipboard — instantly. It also finds dates, times, and events in your emails (flights, appointments, reservations, meetings) and adds them to your Google Calendar.
 
 ## One-Liner Install
 
 ```bash
+# Linux
 curl -fL https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code && ~/.local/bin/verify-code install
 
 # The setup wizard will launch automatically. Just follow the prompts!
@@ -73,7 +74,7 @@ verify-code update
 | `verify-code` | One-shot: find & copy newest code |
 | `verify-code scan` | Scan inbox for events with dates/times (no copy) |
 | `verify-code daemon` | Background: watches inbox, auto-copies, auto-adds events |
-| `verify-code install` | Download latest + install to ~/.local/bin + systemd service |
+| `verify-code install` | Download latest + install to PATH + auto-start service |
 | `verify-code update` | Check for updates; only downloads if newer version exists |
 | `verify-code uninstall` | Remove everything (script, config, data, service) |
 | `verify-code auth` | (Re-)authenticate Google Calendar |
@@ -99,8 +100,18 @@ verify-code update
 
 - Python 3.8+
 - Gmail, Outlook, or Hotmail account with [App Password](https://support.google.com/accounts/answer/185833)
-- `wl-clipboard` (Wayland), `xclip` (X11), or `pbcopy` (macOS)
+- **Linux:** `wl-clipboard` (Wayland) or `xclip` (X11)
+- **Windows:** PowerShell (Set-Clipboard built-in)
+- **macOS:** `pbcopy` (built-in)
 - (Optional) `google-auth-oauthlib` + `google-api-python-client` + `python-dateutil` for Calendar
+
+## Cross-Platform Support
+
+| Platform | Clipboard | Notifications | Auto-start |
+|----------|-----------|---------------|------------|
+| Linux | wl-copy / xclip | notify-send | systemd |
+| Windows | PowerShell Set-Clipboard | PowerShell Toast | Task Scheduler (manual) |
+| macOS | pbcopy | — | — |
 
 ## Safety
 
