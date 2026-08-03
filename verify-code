@@ -2205,148 +2205,348 @@ def dashboard_cmd(args):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>verify-code Dashboard</title>
+<title>verify-code — Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f0f1a;
-    --card: #1a1a2e;
-    --card-hover: #222240;
-    --border: #2a2a4a;
-    --text: #e0e0f0;
-    --text-dim: #8888aa;
-    --accent: #6c63ff;
-    --green: #4ade80;
-    --yellow: #facc15;
-    --red: #ef4444;
-    --cyan: #22d3ee;
-    --magenta: #c084fc;
+    --paper: #EDE6D3;
+    --paper-deep: #E4DBC1;
+    --paper-deeper: #DACFAF;
+    --rule: #C7BB98;
+    --rule-strong: #A99B72;
+    --ink: #262417;
+    --ink-dim: #726A52;
+    --ink-faint: #9B927A;
+    --green: #33513F;
+    --green-deep: #223829;
+    --brass: #9C7C34;
+    --red: #9B3A2C;
   }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { -webkit-font-smoothing: antialiased; }
+
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    padding: 24px;
-    max-width: 1200px;
+    font-family: 'Spectral', Georgia, serif;
+    background: var(--paper);
+    color: var(--ink);
+    min-height: 100vh;
+    position: relative;
+  }
+
+  /* book-gutter shadow down the left edge */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    width: 26px;
+    background: linear-gradient(to right, rgba(38,36,23,0.14), rgba(38,36,23,0));
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  .page {
+    max-width: 980px;
     margin: 0 auto;
+    padding: 44px 32px 80px 56px;
   }
-  .header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px;
+
+  /* ── Masthead ── */
+  .masthead {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 22px;
+    border-bottom: 3px double var(--rule-strong);
+    margin-bottom: 28px;
   }
-  .header h1 { font-size: 24px; font-weight: 700; }
-  .header h1 span { color: var(--accent); }
-  .header-right { display: flex; align-items: center; gap: 12px; }
-  .last-updated { color: var(--text-dim); font-size: 13px; }
-  .refresh-btn {
-    background: var(--accent); color: #fff; border: none;
-    padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600;
-    cursor: pointer; transition: opacity 0.2s;
+  .masthead-title {
+    font-family: 'Fraunces', serif;
+    font-weight: 600;
+    font-size: 40px;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+    line-height: 1;
   }
-  .refresh-btn:hover { opacity: 0.85; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .stat-card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px; transition: background 0.2s;
+  .masthead-title .key { color: var(--green); font-style: italic; font-weight: 500; }
+  .masthead-sub {
+    font-style: italic;
+    color: var(--ink-dim);
+    font-size: 15px;
+    margin-top: 8px;
   }
-  .stat-card:hover { background: var(--card-hover); }
-  .stat-card .label { font-size: 13px; color: var(--text-dim); margin-bottom: 4px; }
-  .stat-card .value { font-size: 28px; font-weight: 700; }
-  .stat-card .sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
-  .section { margin-bottom: 28px; }
-  .section-title {
-    font-size: 18px; font-weight: 600; margin-bottom: 12px;
-    display: flex; align-items: center; gap: 8px;
+  .masthead-right {
+    text-align: right;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
   }
-  table {
-    width: 100%; border-collapse: collapse; font-size: 14px;
-    background: var(--card); border-radius: 12px; overflow: hidden;
+  .stamped-time {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
   }
-  th {
-    text-align: left; padding: 12px 16px; font-weight: 600; font-size: 12px;
-    text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim);
-    background: var(--card); border-bottom: 1px solid var(--border);
+  .stamped-time b { color: var(--ink-dim); font-weight: 600; }
+  .refresh-stamp {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: transparent;
+    color: var(--green);
+    border: 1.5px solid var(--green);
+    border-radius: 3px;
+    padding: 7px 14px;
+    cursor: pointer;
+    transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
-  td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: var(--card-hover); }
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 6px;
-    font-size: 11px; font-weight: 600;
+  .refresh-stamp:hover { background: var(--green); color: var(--paper); }
+  .refresh-stamp:active { transform: scale(0.96) rotate(-1deg); }
+  .refresh-stamp.spinning { animation: pulse 0.6s ease; }
+  @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(0.94) rotate(-2deg); } 100% { transform: scale(1); } }
+
+  /* ── Balance line (summary) ── */
+  .balance-line {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    background: var(--paper-deep);
+    border-top: 1px solid var(--rule-strong);
+    border-bottom: 1px solid var(--rule-strong);
+    margin-bottom: 32px;
   }
-  .badge-active { background: rgba(74, 222, 128, 0.15); color: var(--green); }
-  .badge-trial { background: rgba(250, 204, 21, 0.15); color: var(--yellow); }
-  .badge-cancelled { background: rgba(239, 68, 68, 0.15); color: var(--red); }
-  .badge-code { background: rgba(99, 102, 241, 0.15); color: var(--accent); }
-  .warn { color: var(--yellow); }
-  .renew-today { color: var(--yellow); font-weight: 700; }
-  .code-cell { font-family: 'SF Mono', 'Fira Code', monospace; font-weight: 600; letter-spacing: 1px; }
-  .dim { color: var(--text-dim); }
-  .empty { padding: 32px; text-align: center; color: var(--text-dim); }
-  .amount { font-family: 'SF Mono', monospace; }
-  .loading { text-align: center; padding: 48px; color: var(--text-dim); }
-  .loading::after { content: '...'; animation: dots 1.5s infinite; }
-  @keyframes dots { 0%,20% { content: '.'; } 40% { content: '..'; } 60%,100% { content: '...'; } }
-  .error { text-align: center; padding: 48px; color: var(--red); }
-  .tab-bar { display: flex; gap: 0; margin-bottom: 0; border-bottom: 1px solid var(--border); }
+  .balance-item {
+    padding: 16px 20px;
+    border-left: 1px solid var(--rule);
+    text-align: left;
+  }
+  .balance-item:first-child { border-left: none; }
+  .balance-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    display: block;
+    margin-bottom: 6px;
+  }
+  .balance-value {
+    font-family: 'Fraunces', serif;
+    font-size: 32px;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .balance-value.c-green { color: var(--green); }
+  .balance-value.c-brass { color: var(--brass); }
+  .balance-value.c-ink { color: var(--ink); }
+  .balance-value.c-red { color: var(--red); }
+  .balance-sub {
+    font-size: 12px;
+    color: var(--ink-faint);
+    margin-top: 4px;
+    font-style: italic;
+  }
+
+  /* ── Index tabs ── */
+  .tab-bar {
+    display: flex;
+    gap: 6px;
+    padding-left: 4px;
+  }
   .tab-btn {
-    background: transparent; color: var(--text-dim); border: none;
-    padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer;
-    border-bottom: 2px solid transparent; transition: all 0.2s;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: var(--paper-deeper);
+    color: var(--ink-dim);
+    border: 1px solid var(--rule-strong);
+    border-bottom: none;
+    padding: 9px 18px 8px;
+    cursor: pointer;
+    clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+    position: relative;
+    top: 1px;
+    transition: all 0.15s ease;
   }
-  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
-  .tab-btn:hover { color: var(--text); }
-  .tab-content { display: none; }
+  .tab-btn:hover { color: var(--ink); }
+  .tab-btn.active {
+    background: var(--paper);
+    color: var(--green-deep);
+    font-weight: 600;
+    border-bottom: 1px solid var(--paper);
+    top: 0;
+    padding-top: 10px;
+  }
+
+  .ledger-panel {
+    border: 1px solid var(--rule-strong);
+    border-top: none;
+    background: var(--paper);
+  }
+  .tab-content { display: none; padding: 4px 0 0; }
   .tab-content.active { display: block; }
-  .tooltip { position: relative; cursor: help; }
-  .tooltip:hover::after {
-    content: attr(data-tip); position: absolute; bottom: 100%; left: 50%;
-    transform: translateX(-50%); background: #333; color: #fff; padding: 4px 8px;
-    border-radius: 6px; font-size: 12px; white-space: nowrap; z-index: 10;
+
+  /* ── Ledger table ── */
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    text-align: left;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    padding: 12px 20px 10px;
+    border-bottom: 1.5px solid var(--rule-strong);
   }
-  @media (max-width: 768px) {
-    body { padding: 12px; }
-    .stats { grid-template-columns: 1fr 1fr; }
-    table { font-size: 13px; }
-    th, td { padding: 8px 10px; }
+  thead th.num { text-align: right; }
+  tbody td {
+    padding: 13px 20px;
+    border-bottom: 1px solid var(--rule);
+    font-size: 14.5px;
+    vertical-align: middle;
   }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(51,81,63,0.05); }
+  td.num, th.num { text-align: right; font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
+  td.mono { font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
+  td.service { font-family: 'Fraunces', serif; font-weight: 600; font-size: 15px; }
+  td.dim, span.dim { color: var(--ink-faint); }
+  .code-cell {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    color: var(--green-deep);
+    background: rgba(51,81,63,0.08);
+    padding: 3px 8px;
+    border-radius: 2px;
+  }
+
+  /* ── Stamps (signature element) ── */
+  .stamp {
+    display: inline-block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1.5px solid currentColor;
+    transform: rotate(-3deg);
+    white-space: nowrap;
+  }
+  .stamp-active { color: var(--green); }
+  .stamp-trial { color: var(--brass); }
+  .stamp-cancelled { color: var(--red); text-decoration: line-through; text-decoration-thickness: 1px; }
+  .flag-warn {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--red);
+    font-weight: 600;
+  }
+  .flag-soon { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--brass); }
+  .flag-far { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--ink-faint); }
+
+  /* ── Empty / loading / error states ── */
+  .empty, .loading, .error {
+    padding: 56px 20px;
+    text-align: center;
+    font-style: italic;
+    color: var(--ink-dim);
+    font-size: 15px;
+  }
+  .empty code, .error code {
+    font-style: normal;
+    font-family: 'IBM Plex Mono', monospace;
+    background: var(--paper-deep);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 13px;
+    color: var(--green-deep);
+  }
+  .error { color: var(--red); }
+  .loading::after { content: ' …'; }
+
+  .totals-line {
+    padding: 10px 20px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: var(--ink-dim);
+    border-bottom: 1px solid var(--rule);
+    background: var(--paper-deep);
+  }
+  .totals-line b { color: var(--green-deep); }
+
+  .footnote {
+    margin-top: 18px;
+    font-size: 12px;
+    color: var(--ink-faint);
+    font-style: italic;
+    text-align: center;
+  }
+
+  @media (max-width: 720px) {
+    .page { padding: 28px 16px 60px 32px; }
+    .masthead { flex-direction: column; align-items: flex-start; }
+    .masthead-right { align-items: flex-start; }
+    .balance-line { grid-template-columns: 1fr 1fr; }
+    .balance-item:nth-child(3) { border-left: none; }
+    .balance-item:nth-child(2), .balance-item:nth-child(4) { border-left: 1px solid var(--rule); }
+    thead th, tbody td { padding: 10px 12px; font-size: 13px; }
+    .masthead-title { font-size: 30px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .refresh-stamp.spinning { animation: none; }
+  }
+
+  :focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>🔐 <span>verify-code</span> Dashboard</h1>
-  <div class="header-right">
-    <span class="last-updated" id="lastUpdated">Loading...</span>
-    <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
+<div class="page">
+
+  <div class="masthead">
+    <div>
+      <div class="masthead-title"><span class="key">verify</span>-code</div>
+      <div class="masthead-sub">A running record of what passes through the inbox.</div>
+    </div>
+    <div class="masthead-right">
+      <div class="stamped-time" id="lastUpdated">opening ledger…</div>
+      <button class="refresh-stamp" id="refreshBtn" onclick="loadAll(true)">↻ Refresh entry</button>
+    </div>
   </div>
-</div>
 
-<div class="stats" id="stats"></div>
+  <div class="balance-line" id="stats"></div>
 
-<div class="tab-bar">
-  <button class="tab-btn active" onclick="switchTab('subscriptions', this)">💳 Subscriptions</button>
-  <button class="tab-btn" onclick="switchTab('codes', this)">🔑 Codes</button>
-  <button class="tab-btn" onclick="switchTab('events', this)">📅 Events</button>
-</div>
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="subscriptions" onclick="switchTab('subscriptions', this)">Subscriptions</button>
+    <button class="tab-btn" data-tab="codes" onclick="switchTab('codes', this)">Codes</button>
+    <button class="tab-btn" data-tab="events" onclick="switchTab('events', this)">Events</button>
+  </div>
 
-<div id="tab-subscriptions" class="tab-content active">
-  <div class="section-title">Tracked Subscriptions</div>
-  <div id="subscriptionsContent"><div class="loading">Loading</div></div>
-</div>
+  <div class="ledger-panel">
+    <div id="tab-subscriptions" class="tab-content active">
+      <div id="subscriptionsContent"><div class="loading">Reading the ledger</div></div>
+    </div>
+    <div id="tab-codes" class="tab-content">
+      <div id="codesContent"><div class="loading">Reading the ledger</div></div>
+    </div>
+    <div id="tab-events" class="tab-content">
+      <div id="eventsContent"><div class="loading">Reading the ledger</div></div>
+    </div>
+  </div>
 
-<div id="tab-codes" class="tab-content">
-  <div class="section-title">Recently Copied Codes</div>
-  <div id="codesContent"><div class="loading">Loading</div></div>
-</div>
-
-<div id="tab-events" class="tab-content">
-  <div class="section-title">Calendar Events</div>
-  <div id="eventsContent"><div class="loading">Loading</div></div>
 </div>
 
 <script>
-const PORT = location.port;
-
 function switchTab(name, btn) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -2360,174 +2560,186 @@ function fmtDate(d) {
   if (isNaN(dt.getTime())) return d;
   return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
-
 function fmtTime(d) {
   if (!d) return '';
   const dt = new Date(d);
   if (isNaN(dt.getTime())) return '';
   return dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 }
-
 function daysUntil(dateStr) {
   if (!dateStr) return null;
   const target = new Date(dateStr + 'T00:00:00');
   const now = new Date();
   now.setHours(0,0,0,0);
-  const diff = Math.ceil((target - now) / (1000 * 60 * 60 * 24));
-  return diff;
+  return Math.ceil((target - now) / 86400000);
 }
-
-function warnLabel(days) {
+function warnFlag(days) {
   if (days === null || days === undefined) return '';
-  if (days < 0) return '<span class="dim">(past)</span>';
-  if (days === 0) return '<span class="renew-today">⚠ TODAY</span>';
-  if (days <= 3) return `<span class="warn">⚠ ${days}d</span>`;
-  return `<span class="dim">${days}d</span>`;
+  if (days < 0) return '<span class="dim">past</span>';
+  if (days === 0) return '<span class="flag-warn">due today</span>';
+  if (days <= 3) return `<span class="flag-warn">${days}d left</span>`;
+  if (days <= 10) return `<span class="flag-soon">${days}d</span>`;
+  return `<span class="flag-far">${days}d</span>`;
+}
+function statusStamp(status) {
+  if (status === 'trial') return '<span class="stamp stamp-trial">Trial</span>';
+  if (status === 'cancelled') return '<span class="stamp stamp-cancelled">Cancelled</span>';
+  return '<span class="stamp stamp-active">Active</span>';
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
-function statusBadge(status) {
-  if (status === 'trial') return '<span class="badge badge-trial">⚡ Trial</span>';
-  if (status === 'cancelled') return '<span class="badge badge-cancelled">❌ Cancelled</span>';
-  return '<span class="badge badge-active">● Active</span>';
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch (e) {
+    return [];
+  }
 }
 
-function loadAll() {
-  document.getElementById('lastUpdated').textContent = 'Refreshing...';
-  Promise.all([
-    fetch('/api/subscriptions').then(r => r.json()).catch(() => []),
-    fetch('/api/log').then(r => r.json()).catch(() => []),
-    fetch('/api/state').then(r => r.json()).catch(() => ({})),
-  ]).then(([subs, logEntries, state]) => {
-    const now = new Date();
-    document.getElementById('lastUpdated').textContent =
-      'Updated ' + now.toLocaleTimeString();
+async function loadAll(userTriggered) {
+  const btn = document.getElementById('refreshBtn');
+  if (userTriggered && btn) { btn.classList.remove('spinning'); void btn.offsetWidth; btn.classList.add('spinning'); }
+  document.getElementById('lastUpdated').textContent = 'turning the page…';
 
-    // ── Stats ──
-    const activeSubs = subs.filter(s => s.status !== 'cancelled');
-    const codes = logEntries.filter(e => e.type === 'CODE');
-    const events = logEntries.filter(e => e.type === 'EVENT');
-    document.getElementById('stats').innerHTML = `
-      <div class="stat-card">
-        <div class="label">💳 Active Subscriptions</div>
-        <div class="value" style="color:var(--cyan)">${activeSubs.length}</div>
-        <div class="sub">${subs.length - activeSubs.length} cancelled</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">🔑 Codes Copied</div>
-        <div class="value" style="color:var(--green)">${codes.length}</div>
-        <div class="sub">Last: ${codes.length > 0 ? fmtDate(codes[codes.length-1].ts) : '—'}</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">📅 Events Extracted</div>
-        <div class="value" style="color:var(--yellow)">${events.length}</div>
-        <div class="sub">From ${logEntries.filter(e => e.type === 'EVENT').length} emails</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">⚠ Upcoming Warnings</div>
-        <div class="value" style="color:var(--red)">${subs.filter(s => {
-          const d = daysUntil(s.next_billing || s.trial_end);
-          return d !== null && d >= 0 && d <= 3;
-        }).length}</div>
-        <div class="sub">In the next 3 days</div>
-      </div>
-    `;
-
-    // ── Subscriptions Table ──
-    if (subs.length === 0) {
-      document.getElementById('subscriptionsContent').innerHTML =
-        '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon --subscriptions</code> to start tracking.</div>';
-    } else {
-      const sorted = [...subs].sort((a, b) => {
-        const aStatus = a.status === 'cancelled' ? 1 : 0;
-        const bStatus = b.status === 'cancelled' ? 1 : 0;
-        if (aStatus !== bStatus) return aStatus - bStatus;
-        return (a.next_billing || a.trial_end || '9999') > (b.next_billing || b.trial_end || '9999') ? 1 : -1;
-      });
-      let totalMonthly = 0, totalYearly = 0;
-      sorted.forEach(s => {
-        if (s.amount && s.status !== 'cancelled') {
-          const val = parseFloat(s.amount.replace('$','').replace(',',''));
-          if (s.billing_cycle === 'yearly') totalYearly += val;
-          else if (s.billing_cycle === 'weekly') totalMonthly += val * 4.33;
-          else if (s.billing_cycle === 'quarterly') totalMonthly += val / 3;
-          else totalMonthly += val;
-        }
-      });
-      let totalHtml = '<div class="dim" style="margin-bottom: 8px; font-size: 13px;">';
-      if (totalMonthly > 0) totalHtml += `~$${totalMonthly.toFixed(2)}/month`;
-      if (totalYearly > 0) totalHtml += totalMonthly > 0 ? ` &middot; $${totalYearly.toFixed(2)}/year` : `~$${totalYearly.toFixed(2)}/year`;
-      totalHtml += '</div>';
-
-      let rows = totalHtml + '<table><thead><tr><th>Service</th><th>Plan</th><th>Amount</th><th>Cycle</th><th>Next Billing</th><th>Status</th></tr></thead><tbody>';
-      sorted.forEach(s => {
-        const nextDate = s.next_billing || s.trial_end || null;
-        const days = daysUntil(nextDate);
-        const nextHtml = nextDate
-          ? fmtDate(nextDate) + ' ' + (s.trial_end ? warnLabel(days) : warnLabel(days))
-          : '<span class="dim">—</span>';
-        rows += `<tr>
-          <td><strong>${s.service}</strong></td>
-          <td>${s.plan || '<span class="dim">—</span>'}</td>
-          <td class="amount">${s.amount || '<span class="dim">—</span>'}</td>
-          <td>${s.billing_cycle || '<span class="dim">—</span>'}</td>
-          <td>${nextHtml}</td>
-          <td>${statusBadge(s.status)}</td>
-        </tr>`;
-      });
-      rows += '</tbody></table>';
-      document.getElementById('subscriptionsContent').innerHTML = rows;
-    }
-
-    // ── Codes Table ──
-    if (codes.length === 0) {
-      document.getElementById('codesContent').innerHTML =
-        '<div class="empty">No codes have been copied yet. Run <code>verify-code</code> to get started.</div>';
-    } else {
-      let rows = '<table><thead><tr><th>Time</th><th>Code</th><th>From</th><th>Subject</th></tr></thead><tbody>';
-      [...codes].reverse().slice(0, 50).forEach(e => {
-        const safeCode = e.code || '?';
-        const safeSender = e.sender || '?';
-        const safeSubject = e.subject || '?';
-        rows += `<tr>
-          <td class="dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
-          <td class="code-cell" style="color:var(--green)">${safeCode}</td>
-          <td>${safeSender.length > 35 ? safeSender.slice(0, 35) + '…' : safeSender}</td>
-          <td class="dim">${safeSubject.length > 50 ? safeSubject.slice(0, 50) + '…' : safeSubject}</td>
-        </tr>`;
-      });
-      rows += '</tbody></table>';
-      document.getElementById('codesContent').innerHTML = rows;
-    }
-
-    // ── Events Table ──
-    if (events.length === 0) {
-      document.getElementById('eventsContent').innerHTML =
-        '<div class="empty">No events extracted yet. Run <code>verify-code daemon --calendar</code> to start.</div>';
-    } else {
-      let rows = '<table><thead><tr><th>Time</th><th>Event</th><th>From</th></tr></thead><tbody>';
-      [...events].reverse().slice(0, 50).forEach(e => {
-        const safeEvent = e.event || '?';
-        const safeSender = e.sender || '?';
-        rows += `<tr>
-          <td class="dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
-          <td>${safeEvent}</td>
-          <td>${safeSender.length > 35 ? safeSender.slice(0, 35) + '…' : safeSender}</td>
-        </tr>`;
-      });
-      rows += '</tbody></table>';
-      document.getElementById('eventsContent').innerHTML = rows;
-    }
-  }).catch(err => {
+  let subs, logEntries;
+  try {
+    [subs, logEntries] = await Promise.all([
+      fetchJSON('/api/subscriptions'),
+      fetchJSON('/api/log'),
+    ]);
+  } catch (e) {
     document.getElementById('lastUpdated').textContent = 'Error loading data';
     ['subscriptionsContent', 'codesContent', 'eventsContent'].forEach(id => {
       document.getElementById(id).innerHTML =
-        '<div class="error">Failed to load data. Make sure the daemon has been run at least once.</div>';
+        '<div class="error">Failed to read the ledger. Make sure the daemon has been run at least once.</div>';
     });
-  });
+    return;
+  }
+
+  const now = new Date();
+  document.getElementById('lastUpdated').innerHTML =
+    'Last entry stamped <b>' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</b>';
+
+  // ── Balance line ──
+  const activeSubs = subs.filter(s => s.status !== 'cancelled');
+  const codes = logEntries.filter(e => e.type === 'CODE');
+  const events = logEntries.filter(e => e.type === 'EVENT');
+  const warnings = subs.filter(s => {
+    const d = daysUntil(s.next_billing || s.trial_end);
+    return d !== null && d >= 0 && d <= 3;
+  }).length;
+
+  document.getElementById('stats').innerHTML = `
+    <div class="balance-item">
+      <span class="balance-label">Subscriptions</span>
+      <div class="balance-value c-green">${activeSubs.length}</div>
+      <div class="balance-sub">${subs.length - activeSubs.length} cancelled</div>
+    </div>
+    <div class="balance-item">
+      <span class="balance-label">Codes copied</span>
+      <div class="balance-value c-ink">${codes.length}</div>
+      <div class="balance-sub">last ${codes.length ? fmtDate(codes[codes.length-1].ts) : '—'}</div>
+    </div>
+    <div class="balance-item">
+      <span class="balance-label">Events logged</span>
+      <div class="balance-value c-brass">${events.length}</div>
+      <div class="balance-sub">from the inbox</div>
+    </div>
+    <div class="balance-item">
+      <span class="balance-label">Due within 3 days</span>
+      <div class="balance-value c-red">${warnings}</div>
+      <div class="balance-sub">needs attention</div>
+    </div>
+  `;
+
+  // ── Subscriptions ──
+  const subsEl = document.getElementById('subscriptionsContent');
+  if (subs.length === 0) {
+    subsEl.innerHTML = '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon --subscriptions</code> to open a ledger for them.</div>';
+  } else {
+    const sorted = [...subs].sort((a, b) => {
+      const aC = a.status === 'cancelled' ? 1 : 0, bC = b.status === 'cancelled' ? 1 : 0;
+      if (aC !== bC) return aC - bC;
+      return (a.next_billing || a.trial_end || '9999') > (b.next_billing || b.trial_end || '9999') ? 1 : -1;
+    });
+    let monthly = 0, yearly = 0;
+    sorted.forEach(s => {
+      if (s.amount && s.status !== 'cancelled') {
+        const val = parseFloat(String(s.amount).replace(/[^0-9.]/g, '')) || 0;
+        if (s.billing_cycle === 'yearly') yearly += val;
+        else if (s.billing_cycle === 'weekly') monthly += val * 4.33;
+        else if (s.billing_cycle === 'quarterly') monthly += val / 3;
+        else monthly += val;
+      }
+    });
+    let totals = '<div class="totals-line">';
+    const parts = [];
+    if (monthly > 0) parts.push(`<b>$${monthly.toFixed(2)}</b> / month`);
+    if (yearly > 0) parts.push(`<b>$${yearly.toFixed(2)}</b> / year`);
+    totals += parts.length ? parts.join(' &nbsp;·&nbsp; ') : 'no recurring charges tracked';
+    totals += '</div>';
+
+    let rows = totals + '<table><thead><tr><th>Service</th><th>Plan</th><th class="num">Amount</th><th>Cycle</th><th>Next billing</th><th>Status</th></tr></thead><tbody>';
+    sorted.forEach(s => {
+      const nextDate = s.next_billing || s.trial_end || null;
+      const days = daysUntil(nextDate);
+      const nextHtml = nextDate ? `${fmtDate(nextDate)} &nbsp;${warnFlag(days)}` : '<span class="dim">—</span>';
+      rows += `<tr>
+        <td class="service">${esc(s.service)}</td>
+        <td>${s.plan ? esc(s.plan) : '<span class="dim">—</span>'}</td>
+        <td class="num">${s.amount ? esc(s.amount) : '<span class="dim">—</span>'}</td>
+        <td class="mono">${s.billing_cycle ? esc(s.billing_cycle) : '<span class="dim">—</span>'}</td>
+        <td class="mono">${nextHtml}</td>
+        <td>${statusStamp(s.status)}</td>
+      </tr>`;
+    });
+    rows += '</tbody></table>';
+    subsEl.innerHTML = rows;
+  }
+
+  // ── Codes ──
+  const codesEl = document.getElementById('codesContent');
+  if (codes.length === 0) {
+    codesEl.innerHTML = '<div class="empty">No codes have been copied yet. Run <code>verify-code</code> to log the first entry.</div>';
+  } else {
+    let rows = '<table><thead><tr><th>Time</th><th>Code</th><th>From</th><th>Subject</th></tr></thead><tbody>';
+    [...codes].reverse().slice(0, 50).forEach(e => {
+      const sender = e.sender || '?', subject = e.subject || '?';
+      rows += `<tr>
+        <td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
+        <td><span class="code-cell">${esc(e.code || '?')}</span></td>
+        <td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td>
+        <td class="dim">${esc(subject.length > 50 ? subject.slice(0, 50) + '…' : subject)}</td>
+      </tr>`;
+    });
+    rows += '</tbody></table>';
+    codesEl.innerHTML = rows;
+  }
+
+  // ── Events ──
+  const eventsEl = document.getElementById('eventsContent');
+  if (events.length === 0) {
+    eventsEl.innerHTML = '<div class="empty">No events extracted yet. Run <code>verify-code daemon --calendar</code> to start logging them.</div>';
+  } else {
+    let rows = '<table><thead><tr><th>Time</th><th>Event</th><th>From</th></tr></thead><tbody>';
+    [...events].reverse().slice(0, 50).forEach(e => {
+      const sender = e.sender || '?';
+      rows += `<tr>
+        <td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
+        <td>${esc(e.event || '?')}</td>
+        <td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td>
+      </tr>`;
+    });
+    rows += '</tbody></table>';
+    eventsEl.innerHTML = rows;
+  }
 }
 
-loadAll();
-setInterval(loadAll, 30000);
+loadAll(false);
+setInterval(() => loadAll(false), 30000);
 </script>
 </body>
 </html>"""
