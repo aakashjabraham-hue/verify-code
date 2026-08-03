@@ -1,8 +1,8 @@
-# verify-code 🔐 → 📅
+# verify-code 🔐 → 📅 → 💳
 
-**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar.** Supports **Gmail, Outlook, and Hotmail** on **Linux, Windows, and macOS**.
+**Auto-copy email verification codes to your clipboard. Extract dates/times and add them to Google Calendar. Track subscriptions & get renewal/trial warnings.** Supports **Gmail, Outlook, and Hotmail** on **Linux, Windows, and macOS**.
 
-No more hunting through your inbox for that 2FA code. Verify-code watches your inbox (via IMAP), extracts verification codes, and copies them to your clipboard — instantly. It also finds dates, times, and events in your emails (flights, appointments, reservations, meetings) and adds them to your Google Calendar.
+No more hunting through your inbox for that 2FA code. Verify-code watches your inbox (via IMAP), extracts verification codes, and copies them to your clipboard — instantly. It also tracks your subscriptions — detecting plans, prices, renewals, and free trial expirations from 80+ services — and finds dates/times in your emails (flights, appointments, reservations) to add to your Google Calendar.
 
 ## One-Liner Install
 
@@ -30,8 +30,11 @@ verify-code
 # Scan inbox for events with dates/times
 verify-code scan
 
-# Run the daemon 24/7 (with calendar)
-verify-code daemon --calendar
+# View tracked subscriptions (with warnings & spending totals)
+verify-code subscriptions
+
+# Run the daemon 24/7 with subscription tracking
+verify-code daemon --calendar --subscriptions
 
 # Keep it up to date
 verify-code update
@@ -47,6 +50,17 @@ verify-code history
 - **80+ known senders** whitelist (GitHub, Google, AWS, Microsoft, Discord, banking, gaming, etc.)
 - Marketing email false-positive guard
 - Alphanumeric 2FA support (Discord, Steam, etc.)
+
+### 💳 Subscription Tracker
+- **Auto-detects subscriptions** from your inbox — Netflix, Spotify, Apple, Adobe, GitHub, Discord, and 80+ services
+- **Parses receipts & renewal notices** — extracts plan name, price, billing cycle, and next renewal date
+- **Free trial warnings** — alerts you before a trial converts to paid
+- **Renewal reminders** — warns you N days before a subscription renews
+- **Monthly/yearly totals** — shows your total subscription spend at a glance
+- `verify-code subscriptions` — view all tracked subscriptions in a table
+- `verify-code daemon --subscriptions` — auto-track in background with desktop notifications
+- `verify-code scan --subscriptions` — scan a single email for subscription info
+- Persistent tracking — subscriptions are saved to `~/.local/share/verify-code/subscriptions.json`
 
 ### 📅 Date/Time → Calendar
 - Extracts events from email bodies: flights, appointments, reservations, meetings, deliveries
@@ -85,8 +99,11 @@ verify-code history
 | `verify-code setup` | Interactive wizard: provider + Calendar + clipboard + secure mode |
 | `verify-code` | One-shot: find & copy newest code |
 | `verify-code scan` | Scan inbox for events with dates/times (no copy) |
+| `verify-code scan --subscriptions` | Scan inbox and detect subscriptions |
+| `verify-code subscriptions` | View all tracked subscriptions with warnings and spending totals |
 | `verify-code history` | Show the last 10 copied codes |
 | `verify-code daemon` | Background: watches inbox, auto-copies, auto-adds events |
+| `verify-code daemon --subscriptions` | Daemon + subscription tracking with desktop notifications |
 | `verify-code install` | Download latest + install to PATH + auto-start service |
 | `verify-code update` | Check for updates; only downloads if newer version exists |
 | `verify-code uninstall` | Remove everything (script, config, data, service) |
@@ -103,6 +120,8 @@ verify-code history
 --no-idle               Force polling even if server supports IMAP IDLE
 --calendar              Enable Google Calendar integration (daemon mode)
 --cal-threshold N       Minimum confidence % for calendar events (default: 50)
+--subscriptions         Enable subscription tracking (detect plans, renewals, trials)
+--warn-days N           Days before renewal/trial-end to warn (default: 3)
 --dry-run               Show what would be done, no clipboard or calendar action
 --secure                Enable secure mode (auto-erase clipboard after timeout)
 --secure-timeout N      Seconds before auto-erasing clipboard (default: 30)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify-code v2.2 — grab verification codes, find dates/times, add to calendar.
+verify-code v2.3 — grab codes, find events, track subscriptions, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
@@ -8,6 +8,7 @@ Modes:
   verify-code daemon           Background: watch inbox, auto-copy codes, extract events.
   verify-code install          Install auto-start service for login.
   verify-code scan             Scan inbox for events with dates/times (no code copy).
+  verify-code subscriptions    View all tracked subscriptions with warnings and spending totals.
   verify-code auth             (Re-)authenticate Google Calendar.
   verify-code version          Show the installed version.
   verify-code --version        Show the installed version (alternative).
@@ -15,12 +16,14 @@ Modes:
 
 Features:
   - Gmail, Outlook, and Hotmail IMAP support
+  - Subscription tracking: detect plans, renewals, trials from 80+ services
+  - Free trial warnings and renewal reminders
   - Secure Mode: auto-erase clipboard after N seconds
   - BODY.PEEK so messages are NEVER marked read.
   - IMAP IDLE for instant delivery (falls back to polling).
   - Known-sender whitelist (80+ senders) prevents false positives.
   - Confidence scoring for code extraction.
-  - Dedup tracking — codes never re-copied.
+  - Dedup tracking — codes never re-copied, events never re-added.
   - Atomic state writes with CRC validation.
   - Credentials in ~/.config/verify-code/ (chmod 600).
   - OAuth token stored alongside credentials.
@@ -64,7 +67,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -110,6 +113,7 @@ else:
 CRED_FILE = os.path.join(CONFIG_DIR, "credentials.json")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "log.txt")
+SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
 CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
 
@@ -141,8 +145,8 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║         🔐  verify-code  v2.2  🔐        ║", Style.CYAN, Style.BOLD))
-    print(c("  ║    Auto-copy codes · Find events · 📅    ║", Style.CYAN))
+    print(c("  ║         🔐  verify-code  v2.3  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║    Auto-copy codes · Find events · 💳 Sub  ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
@@ -374,7 +378,7 @@ def _compute_crc(data: dict) -> str:
 
 
 def load_state():
-    default = {"last_uid": 0, "seen_codes": [], "seen_events": [], "last_time": None}
+    default = {"last_uid": 0, "seen_codes": [], "seen_events": [], "seen_subscriptions": [], "last_time": None}
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
@@ -387,6 +391,8 @@ def load_state():
     if stored_crc != computed:
         print(c("⚠  State file corrupted (CRC mismatch); resetting.", Style.YELLOW), file=sys.stderr)
         return default
+    if "seen_subscriptions" not in data:
+        data["seen_subscriptions"] = []
     for k in ("last_uid", "seen_codes", "last_time"):
         if k not in data:
             return default
@@ -398,7 +404,7 @@ def load_state():
 def save_state(state):
     os.makedirs(STATE_DIR, exist_ok=True)
     payload = {k: v for k, v in state.items()
-               if k in ("last_uid", "seen_codes", "seen_events", "last_time")}
+               if k in ("last_uid", "seen_codes", "seen_events", "seen_subscriptions", "last_time")}
     payload["_crc"] = _compute_crc(payload)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -419,6 +425,50 @@ def log_event(sender, subject, code=None, event=None):
             if event:
                 f.write(f"[{ts}] EVENT sender={sender} subject={subject!r} event={event}\n")
         _chmod_600(LOG_FILE)
+    except Exception:
+        pass
+
+
+def _subscription_key(sub: dict) -> str:
+    """Generate a unique key for a subscription to prevent duplicates."""
+    service = sub.get("service", "unknown")
+    plan = sub.get("plan", "")
+    amount = sub.get("amount", "")
+    return f"{service}:{plan}:{amount}"
+
+
+def load_subscriptions() -> list[dict]:
+    """Load tracked subscriptions from disk."""
+    try:
+        with open(SUBSCRIPTIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def save_subscription(sub: dict):
+    """Add or update a subscription in the persistent list."""
+    subs = load_subscriptions()
+    key = _subscription_key(sub)
+    existing = False
+    for i, s in enumerate(subs):
+        if _subscription_key(s) == key:
+            # Update: merge new data with existing (keep older dates, prefer newer info)
+            subs[i] = {**s, **sub}
+            # Keep the earliest next_billing we found
+            if s.get("next_billing") and sub.get("next_billing"):
+                subs[i]["next_billing"] = min(s["next_billing"], sub["next_billing"])
+            existing = True
+            break
+    if not existing:
+        subs.append(sub)
+    # Keep only latest 200 subscriptions
+    subs = subs[-200:]
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(SUBSCRIPTIONS_FILE, "w") as f:
+            json.dump(subs, f, indent=2)
+        _chmod_600(SUBSCRIPTIONS_FILE)
     except Exception:
         pass
 
@@ -571,7 +621,7 @@ def html_to_text(html):
 
 
 def _sender_domain(sender: str) -> str:
-    m = re.search(r"@([^>\\s]+)", sender)
+    m = re.search(r"@([^>\s]+)", sender)
     return m.group(1).lower().lstrip(".") if m else sender.lower()
 
 
@@ -849,6 +899,412 @@ def extract_datetime(text, subject="", sender=""):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Subscription Tracking
+# ═══════════════════════════════════════════════════════════════════════
+
+# Known subscription/receipt senders (domain → service name)
+SUBSCRIPTION_SENDERS = {
+    "netflix.com": "Netflix", "mailer.netflix.com": "Netflix",
+    "spotify.com": "Spotify", "message.spotify.com": "Spotify",
+    "apple.com": "Apple", "appleid.apple.com": "Apple",
+    "icloud.com": "iCloud",
+    "disneyplus.com": "Disney+", "disneyaccount.com": "Disney+",
+    "hbomax.com": "HBO Max", "warnermedia.com": "HBO Max",
+    "hulu.com": "Hulu", "account.hulu.com": "Hulu",
+    "paramountplus.com": "Paramount+", "peacocktv.com": "Peacock",
+    "youtube.com": "YouTube Premium", "youtubemusic.com": "YouTube Music",
+    "adobe.com": "Adobe", "accounts.adobe.com": "Adobe",
+    "microsoft.com": "Microsoft 365", "account.microsoft.com": "Microsoft 365",
+    "notion.com": "Notion", "notion.so": "Notion",
+    "slack.com": "Slack",
+    "linear.app": "Linear",
+    "figma.com": "Figma",
+    "canva.com": "Canva Pro",
+    "zoom.us": "Zoom",
+    "aws.amazon.com": "AWS", "amazonaws.com": "AWS",
+    "digitalocean.com": "DigitalOcean",
+    "vercel.com": "Vercel",
+    "netlify.com": "Netlify",
+    "heroku.com": "Heroku",
+    "github.com": "GitHub", "notifications.github.com": "GitHub",
+    "gitlab.com": "GitLab",
+    "datadoghq.com": "Datadog",
+    "dropbox.com": "Dropbox",
+    "google.com": "Google One", "accounts.google.com": "Google",
+    "mongodb.com": "MongoDB Atlas",
+    "supabase.com": "Supabase",
+    "tailscale.com": "Tailscale",
+    "1password.com": "1Password",
+    "lastpass.com": "LastPass",
+    "bitwarden.com": "Bitwarden",
+    "todoist.com": "Todoist",
+    "evernote.com": "Evernote",
+    "medium.com": "Medium",
+    "patreon.com": "Patreon",
+    "onlyfans.com": "OnlyFans",
+    "substack.com": "Substack",
+    "ghost.org": "Ghost",
+    "wordpress.com": "WordPress.com",
+    "wix.com": "Wix",
+    "mailchimp.com": "Mailchimp",
+    "shopify.com": "Shopify",
+    "stripe.com": "Stripe",
+    "replit.com": "Replit",
+    "railway.app": "Railway",
+    "fly.io": "Fly.io",
+    "render.com": "Render",
+    "namecheap.com": "Namecheap",
+    "godaddy.com": "GoDaddy",
+    "cloudflare.com": "Cloudflare",
+    "atlassian.com": "Atlassian",
+    "trello.com": "Trello",
+    "jira.com": "Jira",
+    "discord.com": "Discord Nitro",
+    "telegram.org": "Telegram Premium",
+    "x.com": "X Premium",
+    "twitter.com": "X Premium",
+    "tidal.com": "Tidal",
+    "deezer.com": "Deezer",
+    "pandora.com": "Pandora",
+    "soundcloud.com": "SoundCloud",
+    "crunchyroll.com": "Crunchyroll",
+    "funimation.com": "Funimation",
+    "newyorktimes.com": "NYTimes",
+    "nytimes.com": "NYTimes",
+    "wsj.com": "WSJ",
+    "washingtonpost.com": "Washington Post",
+    "theatlantic.com": "The Atlantic",
+    "economist.com": "The Economist",
+    "nintendo.com": "Nintendo Switch Online",
+    "playstation.com": "PlayStation Plus",
+    "xbox.com": "Xbox Game Pass",
+    "roblox.com": "Roblox Premium",
+    "epicgames.com": "Epic Games",
+    "steampowered.com": "Steam",
+    "blizzard.com": "Blizzard",
+    "ea.com": "EA Play",
+    "ubisoft.com": "Ubisoft+",
+}
+
+# Subscription keywords in email subject/body
+SUBSCRIPTION_KEYWORDS = re.compile(
+    r"(?:subscription|subscribed|subscribing|renewal|renewed|renewing|renew|"
+    r"trial|free trial|trial period|trial ends|trial ending|"
+    r"billing|bill|invoice|receipt|payment|charged|charge|"
+    r"upgrade|downgrade|plan change|cancel|cancelled|cancellation|"
+    r"automatic payment|auto-renew|auto[- ]?renew|"
+    r"your plan|your membership|your account|"
+    r"next payment|payment due|due date|"
+    r"thank you for your (?:purchase|order|payment))",
+    re.I,
+)
+
+# Regex to extract dollar amounts
+RE_AMOUNT = re.compile(r"\$(\d{1,6}(?:[.,]\d{2})?)")
+
+# Regex to extract billing cycles
+RE_BILLING_CYCLE = re.compile(
+    r"(?:billed|billing|charge|charged|renews|renewal|every|each|per|[/])\s*"
+    r"(monthly|month|yearly|annual|year|weekly|week|quarterly|quarter)",
+    re.I,
+)
+
+# Regex to extract plan names
+RE_PLAN_NAME = re.compile(
+    r"(?:plan|tier|level|package|subscription)\s*:?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9\s.'\-+]{1,20}?)(?:\s*\$|\s*[.!,]|\s*$|"
+    r"\s+(?:plan|subscription|tier|level)\b)",
+    re.I,
+)
+
+# Regex to find dates near subscription keywords
+RE_SUB_DATE = re.compile(
+    r"(?:on|by|before|after|for|date:|\\.)?\s*"
+    r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?)",
+    re.I,
+)
+
+# Simple date like "2026-08-20" or "8/20/2026" near sub keywords
+RE_SUB_DATE_ISO = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
+RE_SUB_DATE_US = re.compile(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})")
+
+
+def _lookup_service_name(sender: str) -> str | None:
+    """Look up the friendly service name from a sender email domain."""
+    domain = _sender_domain(sender)
+    if domain in SUBSCRIPTION_SENDERS:
+        return SUBSCRIPTION_SENDERS[domain]
+    # Try subdomain stripping
+    parts = domain.split(".")
+    for i in range(len(parts) - 1):
+        candidate = ".".join(parts[i:])
+        if candidate in SUBSCRIPTION_SENDERS:
+            return SUBSCRIPTION_SENDERS[candidate]
+    return None
+
+
+def extract_subscription(text, subject="", sender="") -> dict | None:
+    """Extract subscription info from an email body.
+
+    Returns a dict with:
+      - service: str (friendly name)
+      - plan: str or None
+      - amount: str or None (e.g. "$14.99")
+      - billing_cycle: str or None (monthly/yearly/weekly)
+      - next_billing: str or None (ISO date)
+      - trial_end: str or None (ISO date)
+      - status: str (active/trial/cancelled)
+      - confidence: 0-100
+      - source: str
+      - sender: str
+      - subject: str
+    Returns None if no subscription info detected.
+    """
+    body = text[:5000]
+    combined = f"{subject} {sender} {body}"
+
+    # Quick check: does this look subscription-related at all?
+    if not SUBSCRIPTION_KEYWORDS.search(combined):
+        return None
+
+    service_name = _lookup_service_name(sender)
+    known_sender = service_name is not None
+
+    body_lower = body.lower() + " " + subject.lower()
+
+    # ── Detect status ──
+    status = "active"
+    if re.search(r"(?:trial|free trial|trial period|trial ends|trial ending)", combined, re.I):
+        status = "trial"
+    if re.search(r"(?:cancelled|canceled|cancelling|canceling|cancellation|"
+                 r"cancel your|you cancelled|has been cancelled)", combined, re.I):
+        status = "cancelled"
+
+    # ── Extract amount ──
+    amount = None
+    amt_matches = RE_AMOUNT.findall(body)
+    if amt_matches:
+        amount = f"${amt_matches[0]}"
+
+    # ── Extract billing cycle ──
+    billing_cycle = None
+    bc_m = RE_BILLING_CYCLE.search(body)
+    if bc_m:
+        raw = bc_m.group(1).lower()
+        if raw in ("month", "monthly"):
+            billing_cycle = "monthly"
+        elif raw in ("year", "yearly", "annual"):
+            billing_cycle = "yearly"
+        elif raw in ("week", "weekly"):
+            billing_cycle = "weekly"
+        elif raw == "quarterly":
+            billing_cycle = "quarterly"
+
+    # ── Extract plan name ──
+    plan = None
+    # Pattern 1: "plan: [name]" or "plan [name]"
+    plan_m = RE_PLAN_NAME.search(body)
+    if plan_m:
+        candidate = plan_m.group(1).strip()
+        # Filter out false positives (too long, looks like a sentence fragment)
+        if len(candidate) < 30 and not re.search(r"(?:will|your|this|that|has|have|been|with|for|the|and|our|we|you|to|is|are|was|on|at|it|in)", candidate, re.I):
+            plan = candidate
+    # Pattern 2: "the [Name] plan" or "your [Name] plan" or "[Name] Plan"
+    if plan is None:
+        plan_m2 = re.search(
+            r"(?:the|your|our|this)\s+([A-Za-z][A-Za-z0-9\s.'\-+]{1,20}?)\s+"
+            r"(?:plan|tier|level|package|subscription)\b",
+            body, re.I
+        )
+        if plan_m2:
+            candidate = plan_m2.group(1).strip()
+            if len(candidate) < 30:
+                plan = candidate
+
+    # ── Extract dates ──
+    next_billing = None
+    trial_end = None
+
+    if DATEUTIL_AVAILABLE:
+        now = datetime.datetime.now()
+
+        # Look for explicit dates near subscription keywords
+        for m in RE_SUB_DATE.finditer(body):
+            try:
+                dt = dateparser.parse(m.group(1), fuzzy=False, default=now)
+                if dt and dt > datetime.datetime(2000, 1, 1):
+                    iso = dt.strftime("%Y-%m-%d")
+                    # Check context: is this a trial end or next billing?
+                    ctx = body[max(0, m.start() - 60):m.end() + 60].lower()
+                    if re.search(r"(?:trial ends|trial ending|trial period ends|"
+                                 r"free trial ends|trial expires)", ctx):
+                        trial_end = iso
+                    elif status == "trial":
+                        trial_end = iso
+                    else:
+                        next_billing = iso
+            except (ValueError, TypeError):
+                pass
+
+        # ISO dates
+        for m in RE_SUB_DATE_ISO.finditer(body):
+            try:
+                dt = dateparser.parse(m.group(1), fuzzy=False)
+                if dt and dt > datetime.datetime(2000, 1, 1):
+                    if trial_end is None:
+                        ctx = body[max(0, m.start() - 60):m.end() + 60].lower()
+                        if re.search(r"(?:trial|free)", ctx):
+                            trial_end = dt.strftime("%Y-%m-%d")
+                    if next_billing is None:
+                        next_billing = dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+
+        # US dates
+        for m in RE_SUB_DATE_US.finditer(body):
+            try:
+                parts = m.group(1).replace("-", "/").split("/")
+                parts = [int(p) for p in parts]
+                if 1 <= parts[0] <= 12 and 1 <= parts[1] <= 31 and parts[2] >= 2020:
+                    dt = datetime.datetime(parts[2], parts[0], parts[1])
+                    if trial_end is None:
+                        ctx = body[max(0, m.start() - 60):m.end() + 60].lower()
+                        if re.search(r"(?:trial|free)", ctx):
+                            trial_end = dt.strftime("%Y-%m-%d")
+                    if next_billing is None:
+                        next_billing = dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+
+        # If nothing found, try fuzzy date parsing
+        if next_billing is None and trial_end is None:
+            # Look for "renews on [date]" or "will be charged on [date]"
+            for pat in [
+                re.compile(r"(?:renews|will renew|next renewal|next billing)[:\s]+"
+                           r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+                           r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+                           r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
+                re.compile(r"(?:charged|payment|billed)[:\s]+(?:on|the)\s+"
+                           r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+                           r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+                           r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
+            ]:
+                m = pat.search(body)
+                if m:
+                    try:
+                        dt = dateparser.parse(m.group(1), fuzzy=False, default=now)
+                        if dt and dt > datetime.datetime(2000, 1, 1):
+                            next_billing = dt.strftime("%Y-%m-%d")
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
+    # ── Compute confidence ──
+    confidence = 0
+    signals = 0
+
+    if known_sender:
+        confidence += 30
+        signals += 1
+    if amount:
+        confidence += 20
+        signals += 1
+    if billing_cycle:
+        confidence += 15
+        signals += 1
+    if next_billing or trial_end:
+        confidence += 20
+        signals += 1
+    if plan:
+        confidence += 10
+        signals += 1
+    if status == "trial":
+        confidence += 5  # trial status is a strong signal
+
+    if not known_sender and not amount:
+        # Generic subscription email, low confidence
+        confidence = max(confidence, 15)
+
+    if confidence < 20:
+        return None
+
+    confidence = min(confidence, 98)
+
+    # ── Build result ──
+    # If no known service, try to guess from subject
+    if service_name is None:
+        # Try to extract a service name from the sender domain
+        domain = _sender_domain(sender)
+        # Clean up common prefixes
+        service_name = domain.replace("mail.", "").replace("message.", "") \
+            .replace("noreply.", "").replace("accounts.", "") \
+            .replace("account.", "").replace("e.", "") \
+            .split(".")[0].title()
+
+    result = {
+        "service": service_name or "Unknown",
+        "plan": plan,
+        "amount": amount,
+        "billing_cycle": billing_cycle,
+        "next_billing": next_billing,
+        "trial_end": trial_end,
+        "status": status,
+        "confidence": confidence,
+        "source": "email",
+        "sender": sender,
+        "subject": subject,
+    }
+    return result
+
+
+def format_subscription(sub, warn=False) -> str:
+    """Format a subscription dict into a human-readable line."""
+    parts = [c(sub["service"], Style.BOLD, Style.CYAN) if not warn else c(sub["service"], Style.BOLD, Style.YELLOW)]
+    if sub["plan"]:
+        parts.append(f"({sub['plan']})")
+    if sub["amount"]:
+        parts.append(sub["amount"])
+    if sub["billing_cycle"]:
+        parts.append(f"/{sub['billing_cycle']}")
+    if sub["next_billing"]:
+        parts.append(f"→ renews {sub['next_billing']}")
+    if sub["trial_end"]:
+        parts.append(c(f"⚠ trial ends {sub['trial_end']}", Style.YELLOW) if warn else f"trial ends {sub['trial_end']}")
+    if sub["status"] == "cancelled":
+        parts.append(c("❌ cancelled", Style.RED, Style.BOLD))
+    # Confidence bar
+    conf_bar = "█" * (sub["confidence"] // 10) + "░" * (10 - sub["confidence"] // 10)
+    parts.append(c(f"({conf_bar} {sub['confidence']}%)", Style.DIM))
+    return "  ".join(parts)
+
+
+def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -> list[dict]:
+    """Check which subscriptions need warnings (about to renew or trial ending)."""
+    now = datetime.datetime.now().date()
+    warnings = []
+    for sub in subscriptions:
+        if sub.get("next_billing"):
+            try:
+                renew_date = datetime.datetime.strptime(sub["next_billing"], "%Y-%m-%d").date()
+                days_until = (renew_date - now).days
+                if 0 <= days_until <= warn_days:
+                    warnings.append({**sub, "warn_type": "renewal", "days_until": days_until})
+            except ValueError:
+                pass
+        if sub.get("trial_end"):
+            try:
+                trial_date = datetime.datetime.strptime(sub["trial_end"], "%Y-%m-%d").date()
+                days_until = (trial_date - now).days
+                if 0 <= days_until <= warn_days:
+                    warnings.append({**sub, "warn_type": "trial_end", "days_until": days_until})
+            except ValueError:
+                pass
+    return warnings
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Google Calendar Integration
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1110,7 +1566,7 @@ def supports_idle(con):
 def setup():
     """Interactive, fun setup wizard."""
     print_banner()
-    print(c("  Welcome to verify-code v2.2! Let's get you set up. 🚀", Style.BOLD))
+    print(c("  Welcome to verify-code v2.3! Let's get you set up. 🚀", Style.BOLD))
     print()
     time.sleep(0.5)
 
@@ -1534,6 +1990,36 @@ def run(args):
             if res["events"]:
                 print(c("  ⚠  Calendar not authorized. Run: verify-code auth", Style.YELLOW))
 
+    # Handle subscriptions (one-shot mode)
+    if args.subscriptions and res.get("body") and not args.dry_run:
+        sub = extract_subscription(res["body"], res["subject"], res["sender"])
+        if sub:
+            dedup_key = _subscription_key(sub)
+            state = load_state()
+            seen_subs = set(state.get("seen_subscriptions", []))
+            if dedup_key not in seen_subs:
+                seen_subs.add(dedup_key)
+                save_subscription(sub)
+                log_event(res["sender"], res["subject"], event=f"sub:{sub['service']}")
+                save_state({
+                    "last_uid": state.get("last_uid", 0),
+                    "seen_codes": state.get("seen_codes", []),
+                    "seen_events": state.get("seen_events", []),
+                    "seen_subscriptions": list(seen_subs),
+                    "last_time": datetime.datetime.now().isoformat(),
+                })
+                print(c(f"  💳  Subscription detected: {sub['service']}", Style.MAGENTA, Style.BOLD))
+                if sub["amount"]:
+                    print(f"      {sub['amount']}", end="")
+                    if sub["billing_cycle"]:
+                        print(f"/{sub['billing_cycle']}", end="")
+                    print()
+                if sub["next_billing"]:
+                    print(f"      Next renewal: {sub['next_billing']}")
+                if sub["trial_end"]:
+                    print(c(f"      ⚠ Trial ends: {sub['trial_end']}", Style.YELLOW))
+                print()
+
 
 def history_cmd():
     """Show the last 10 copied verification codes."""
@@ -1580,6 +2066,132 @@ def history_cmd():
     print()
 
 
+def subscriptions_cmd(args):
+    """Show tracked subscriptions and upcoming warnings."""
+    subs = load_subscriptions()
+
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   💳  Subscription Tracker              ║", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    if not subs:
+        print(c("  No subscriptions tracked yet.", Style.DIM))
+        print()
+        print("  Run the daemon to auto-detect subscriptions from your inbox.")
+        print("  Or run: verify-code scan --subscriptions")
+        print()
+        return
+
+    # ── Check for warnings ──
+    warn_days = args.warn_days if args.warn_days else 3
+    warnings = check_subscription_warnings(subs, warn_days=warn_days)
+
+    if warnings:
+        print(c(f"  ⚠  Upcoming Changes ({warn_days}-day window)", Style.YELLOW, Style.BOLD))
+        print()
+        for w in warnings:
+            if w["warn_type"] == "trial_end":
+                label = c(f"  ⚠  Trial ends in {w['days_until']}d", Style.YELLOW, Style.BOLD)
+                print(f"  {label}  {format_subscription(w, warn=True)}")
+            elif w["warn_type"] == "renewal":
+                if w["days_until"] == 0:
+                    label = c(f"  🔄  Renewing TODAY", Style.YELLOW, Style.BOLD)
+                else:
+                    label = c(f"  🔄  Renews in {w['days_until']}d", Style.YELLOW, Style.BOLD)
+                print(f"  {label}  {format_subscription(w, warn=True)}")
+        print()
+
+    # ── Sort and display all subscriptions ──
+    # Sort: active first, then by next_billing
+    def sort_key(s):
+        status_rank = 0 if s.get("status") == "cancelled" else 1
+        billing = s.get("next_billing") or s.get("trial_end") or "9999-99-99"
+        return (status_rank, billing)
+
+    subs_sorted = sorted(subs, key=sort_key)
+
+    # Calculate summary stats
+    active = [s for s in subs_sorted if s.get("status") != "cancelled"]
+    total_monthly = 0
+    total_yearly = 0
+    for s in active:
+        amt = s.get("amount", "")
+        if amt:
+            try:
+                val = float(amt.replace("$", "").replace(",", ""))
+                cycle = s.get("billing_cycle")
+                if cycle == "yearly":
+                    total_yearly += val
+                elif cycle == "monthly":
+                    total_monthly += val
+                elif cycle == "weekly":
+                    total_monthly += val * 4.33
+                elif cycle == "quarterly":
+                    total_monthly += val / 3
+                else:
+                    # Unknown cycle — assume monthly
+                    total_monthly += val
+            except (ValueError, TypeError):
+                pass
+
+    print(c(f"  📊  {len(active)} active subscriptions", Style.BOLD))
+    if total_monthly > 0:
+        print(f"     ~${total_monthly:.2f}/month", end="")
+        if total_yearly > 0:
+            print(f"  ($" + f"{total_yearly:.2f}/year)", end="")
+        print(f"  |  {len(subs_sorted) - len(active)} cancelled")
+    elif total_yearly > 0:
+        print(f"     ~${total_yearly:.2f}/year  |  {len(subs_sorted) - len(active)} cancelled")
+    else:
+        print(f"     {len(subs_sorted) - len(active)} cancelled")
+    print()
+
+    # ── Display table ──
+    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+    print(c("  Service           Plan        Amount   Cycle     Next Billing", Style.BOLD))
+    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+
+    for sub in subs_sorted:
+        service = sub["service"][:18].ljust(18)
+        plan = (sub.get("plan") or "")[:12].ljust(12)
+        amount = (sub.get("amount") or "").rjust(8)
+        cycle = (sub.get("billing_cycle") or "").ljust(9)
+        if sub.get("next_billing"):
+            next_bill = sub["next_billing"]
+        elif sub.get("trial_end"):
+            next_bill = c(f"trial:{sub['trial_end']}", Style.YELLOW)
+        else:
+            next_bill = "—"
+
+        status_mark = ""
+        if sub.get("status") == "cancelled":
+            status_mark = c(" ❌", Style.RED)
+        elif sub.get("status") == "trial":
+            status_mark = c(" ⚡", Style.YELLOW)
+        else:
+            # Check if about to renew soon
+            if sub.get("next_billing"):
+                try:
+                    renew_date = datetime.datetime.strptime(sub["next_billing"], "%Y-%m-%d").date()
+                    days_until = (renew_date - datetime.datetime.now().date()).days
+                    if 0 <= days_until <= warn_days:
+                        status_mark = c(" ⚠", Style.YELLOW)
+                except ValueError:
+                    pass
+
+        print(f"  {service}{plan}{amount} {cycle}{next_bill}{status_mark}")
+
+    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+    print()
+
+    # ── Show usage ──
+    print(c("  Tip:", Style.DIM), "subscriptions are auto-detected from inbox emails.")
+    print(c("  Run:", Style.DIM), "verify-code daemon --subscriptions  (to track in background)")
+    print()
+
+
 def daemon_run(args):
     """Background daemon mode: watch inbox, auto-copy codes, extract events."""
     creds = load_creds()
@@ -1588,6 +2200,7 @@ def daemon_run(args):
     last_uid = int(state.get("last_uid", 0))
     seen_codes = set(state.get("seen_codes", []))
     seen_events = set(state.get("seen_events", []))
+    seen_subscriptions = set(state.get("seen_subscriptions", []))
     interval = args.interval
 
     have_calendar = bool(get_calendar_service())
@@ -1610,6 +2223,7 @@ def daemon_run(args):
     print(f"     Window: {args.minutes}m  |  Interval: {interval}s"
           f"  |  Known-senders: {'yes' if args.known_senders else 'no'}"
           f"  |  Calendar: {'yes' if have_calendar else 'no'}"
+          f"  |  Subs: {'yes' if args.subscriptions else 'no'}"
           f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}")
     if have_calendar:
         print(f"     Calendar min confidence: {args.cal_threshold}%")
@@ -1687,12 +2301,37 @@ def daemon_run(args):
                                     if len(seen_events) > 50:
                                         seen_events = set(list(seen_events)[-50:])
 
+                    # ── Handle subscriptions ──
+                    if args.subscriptions:
+                        sub = extract_subscription(res["body"], res["subject"], res["sender"])
+                        if sub:
+                            dedup_key = _subscription_key(sub)
+                            if dedup_key not in seen_subscriptions:
+                                seen_subscriptions.add(dedup_key)
+                                save_subscription(sub)
+                                log_event(res["sender"], res["subject"], event=f"sub:{sub['service']}")
+                                msg = f"💳  {sub['service']}"
+                                if sub["amount"]:
+                                    msg += f" {sub['amount']}"
+                                if sub["billing_cycle"]:
+                                    msg += f"/{sub['billing_cycle']}"
+                                if sub["next_billing"]:
+                                    msg += f" → renews {sub['next_billing']}"
+                                elif sub["trial_end"]:
+                                    msg += f" → trial ends {sub['trial_end']}"
+                                notify("Subscription detected", msg)
+                                print(c(f"  [{now_ts}] {msg}", Style.MAGENTA), flush=True)
+                                # Keep bounded
+                                if len(seen_subscriptions) > 50:
+                                    seen_subscriptions = set(list(seen_subscriptions)[-50:])
+
                     # Update state (even if only UID advanced)
                     last_uid = max(last_uid, res["uid"])
                     save_state({
                         "last_uid": last_uid,
                         "seen_codes": list(seen_codes),
                         "seen_events": list(seen_events),
+                        "seen_subscriptions": list(seen_subscriptions),
                         "last_time": datetime.datetime.now().isoformat(),
                     })
 
@@ -1750,6 +2389,23 @@ def scan_mode(args):
         print("  No events with dates/times found.")
         print("  Tip: Try --minutes 60 to scan a wider window.")
         print()
+
+    # ── Handle subscriptions ──
+    if args.subscriptions and res["body"]:
+        sub = extract_subscription(res["body"], res["subject"], res["sender"])
+        if sub:
+            print(c("  💳  Subscription detected:", Style.MAGENTA, Style.BOLD))
+            print()
+            print(f"     {format_subscription(sub)}")
+            print()
+            # Save it
+            save_subscription(sub)
+            print(c("  ✅  Subscription saved to tracker.", Style.GREEN))
+            print(c("  Run: verify-code subscriptions  (to view all tracked)", Style.DIM))
+            print()
+        else:
+            print("  💳  No subscription info detected in this email.")
+            print()
 
 
 def install_service(args):
@@ -2210,15 +2866,18 @@ def update_self():
 
 def main():
     p = argparse.ArgumentParser(
-        description=f"verify-code v{__version__} — Copy codes, find events, add to calendar.",
+        description=f"verify-code v{__version__} — Copy codes, find events, track subscriptions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 Examples:
   verify-code setup              # Interactive wizard (fun! 🎉)
   verify-code                    # One-shot: copy latest code
   verify-code scan               # Scan inbox for events
+  verify-code scan --subscriptions  # Scan for subscriptions
   verify-code daemon             # Background: watch, copy, calendar
+  verify-code daemon --subscriptions  # Daemon + subscription tracking
   verify-code daemon --no-idle   # Force polling
+  verify-code subscriptions      # View tracked subscriptions
   verify-code install            # Install to ~/.local/bin + systemd service
   verify-code update             # Download the latest version from GitHub
   verify-code uninstall          # Remove everything (script, config, data)
@@ -2238,8 +2897,8 @@ One-liner install (Windows PowerShell):
 """
     )
     p.add_argument("cmd", nargs="?", default="run",
-                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version", "history"],
-                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version | history")
+                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version", "history", "subscriptions"],
+                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version | history | subscriptions")
     p.add_argument("--minutes", type=int, default=10,
                    help="lookback window in minutes (default 10)")
     p.add_argument("--interval", type=int, default=15,
@@ -2258,6 +2917,10 @@ One-liner install (Windows PowerShell):
                    help="enable secure mode (auto-erase clipboard after timeout)")
     p.add_argument("--secure-timeout", type=int, default=0,
                    help="seconds before auto-erasing clipboard in secure mode (default: from config)")
+    p.add_argument("--subscriptions", action="store_true",
+                   help="enable subscription tracking (detect plans, renewals, trials)")
+    p.add_argument("--warn-days", type=int, default=3,
+                   help="days before renewal/trial-end to warn (default: 3)")
     p.add_argument("--script-path", default=sys.argv[0],
                    help="path to this script (for install; auto-detected)")
     p.add_argument("--version", action="version", version=f"verify-code v{__version__}")
@@ -2287,6 +2950,8 @@ One-liner install (Windows PowerShell):
         print(c(f"  verify-code v{__version__}", Style.GREEN, Style.BOLD))
     elif args.cmd == "history":
         history_cmd()
+    elif args.cmd == "subscriptions":
+        subscriptions_cmd(args)
     else:
         run(args)
 
