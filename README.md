@@ -7,10 +7,15 @@ No more hunting through your inbox for that 2FA code. Verify-code watches your i
 ## One-Liner Install
 
 ```bash
-# Linux
+# Linux / macOS
 curl -fL https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code && ~/.local/bin/verify-code install
 
 # The setup wizard will launch automatically. Just follow the prompts!
+```
+
+```powershell
+# Windows (run in PowerShell)
+powershell -Command "iwr -Uri 'https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code' -OutFile \"$env:APPDATA\verify-code\verify-code.py\"; python \"$env:APPDATA\verify-code\verify-code.py\" install"
 ```
 
 ## Quick Start
@@ -30,6 +35,9 @@ verify-code daemon --calendar
 
 # Keep it up to date
 verify-code update
+
+# View copied code history
+verify-code history
 ```
 
 ## Features
@@ -57,6 +65,10 @@ verify-code update
 - Prevents codes from lingering in your clipboard
 - Enable during setup or via `--secure --secure-timeout 15` on the daemon
 
+### 📋 Code History
+- `verify-code history` shows the last 10 copied codes with timestamps and sender info
+- Full history is logged to `~/.local/share/verify-code/log.txt` (Linux/macOS) or `%APPDATA%\verify-code\data\log.txt` (Windows)
+
 ### ⚡ Instant Delivery
 - IMAP IDLE push notifications — no polling
 - Falls back to smart polling automatically
@@ -73,6 +85,7 @@ verify-code update
 | `verify-code setup` | Interactive wizard: provider + Calendar + clipboard + secure mode |
 | `verify-code` | One-shot: find & copy newest code |
 | `verify-code scan` | Scan inbox for events with dates/times (no copy) |
+| `verify-code history` | Show the last 10 copied codes |
 | `verify-code daemon` | Background: watches inbox, auto-copies, auto-adds events |
 | `verify-code install` | Download latest + install to PATH + auto-start service |
 | `verify-code update` | Check for updates; only downloads if newer version exists |
@@ -111,7 +124,7 @@ verify-code update
 |----------|-----------|---------------|------------|
 | Linux | wl-copy / xclip | notify-send | systemd |
 | Windows | PowerShell Set-Clipboard | PowerShell Toast | Task Scheduler (manual) |
-| macOS | pbcopy | — | — |
+| macOS | pbcopy | osascript notification | — |
 
 ## Safety
 

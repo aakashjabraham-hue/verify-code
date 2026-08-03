@@ -6,11 +6,12 @@ Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
   verify-code                  One-shot: copy newest verification code from last 10 min.
   verify-code daemon           Background: watch inbox, auto-copy codes, extract events.
-  verify-code install          Install systemd user service for auto-start on login.
+  verify-code install          Install auto-start service for login.
   verify-code scan             Scan inbox for events with dates/times (no code copy).
   verify-code auth             (Re-)authenticate Google Calendar.
   verify-code version          Show the installed version.
   verify-code --version        Show the installed version (alternative).
+  verify-code history          Show the last 10 copied verification codes.
 
 Features:
   - Gmail, Outlook, and Hotmail IMAP support
@@ -67,10 +68,14 @@ __version__ = "2.2.0"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
 
 def _which(name):
     """Cross-platform: find an executable in PATH."""
-    cmd = ["where", name] if IS_WINDOWS else ["which", name]
+    if IS_WINDOWS:
+        cmd = ["where", name]
+    else:
+        cmd = ["which", name]
     return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
 
 def _chmod_600(path):
@@ -94,6 +99,10 @@ if IS_WINDOWS:
     CONFIG_DIR = os.path.join(appdata, "verify-code")
     STATE_DIR = os.path.join(appdata, "verify-code", "data")
     SERVICE_FILE = None  # no systemd on Windows
+elif IS_MACOS:
+    CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
+    STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
+    SERVICE_FILE = None  # no launchd integration yet
 else:
     CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
     STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
@@ -428,6 +437,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("verify-code").Show($toast)
 '''
             subprocess.run(["powershell", "-Command", ps_script], capture_output=True, timeout=10)
+        except Exception:
+            pass
+    elif IS_MACOS:
+        try:
+            subprocess.run(["osascript", "-e",
+                f'display notification "{body.replace(chr(34), "")}" with title "{title}"'],
+                capture_output=True, timeout=5)
         except Exception:
             pass
     else:
@@ -1493,6 +1509,13 @@ def run(args):
         print(c(f"  Code:    {res['code']}", Style.CYAN, Style.BOLD))
         print(f"  Confidence: {res['confidence']}%  ({res['method']})")
         print()
+    else:
+        print(c("  📭  Email found, but no verification code could be extracted.", Style.YELLOW))
+        print(f"  From:    {res['sender']}")
+        print(f"  Subject: {res['subject']}")
+        if res.get("events"):
+            print(f"  📅  {len(res['events'])} event(s) found in this email.")
+        print()
 
     # Handle events
     if res["events"] and args.calendar and not args.dry_run:
@@ -1510,6 +1533,51 @@ def run(args):
         else:
             if res["events"]:
                 print(c("  ⚠  Calendar not authorized. Run: verify-code auth", Style.YELLOW))
+
+
+def history_cmd():
+    """Show the last 10 copied verification codes."""
+    print()
+    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ║   📋  verify-code history                ║", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print()
+
+    if not os.path.exists(LOG_FILE):
+        print(c("  No codes copied yet.", Style.DIM))
+        print()
+        return
+
+    try:
+        with open(LOG_FILE) as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(c(f"  ✗  Could not read history: {e}", Style.RED))
+        return
+
+    # Filter for CODE entries, take last 10
+    code_entries = [l.strip() for l in lines if " CODE " in l]
+    if not code_entries:
+        print(c("  No codes have been copied yet.", Style.DIM))
+        print()
+        return
+
+    for entry in code_entries[-10:]:
+        # Parse: [2026-08-02 17:00:00] CODE sender=... subject=... code=...
+        m = re.match(r"\[(.*?)\] CODE sender=(.*?) subject=(.*?) code=(.*)", entry)
+        if m:
+            ts, sender, subject, code = m.groups()
+            print(f"  {c(ts, Style.DIM)}  {c(code, Style.GREEN, Style.BOLD)}  "
+                  f"from {c(sender[:30], Style.DIM)}")
+        else:
+            print(f"  {entry}")
+
+    print()
+    print(c(f"  Showing {min(len(code_entries), 10)} of {len(code_entries)} total entries.", Style.DIM))
+    print()
+    print("  Full log: ~/.local/share/verify-code/log.txt (Linux/macOS)")
+    print("  or:       %APPDATA%\\verify-code\\data\\log.txt (Windows)")
+    print()
 
 
 def daemon_run(args):
@@ -2157,17 +2225,21 @@ Examples:
   verify-code auth               # (Re-)auth Google Calendar
   verify-code version            # Show version
   verify-code --version          # Show version (alternative)
+  verify-code history            # Show last 10 copied codes
   verify-code daemon --secure --secure-timeout 15  # Daemon with auto-erase
 
-One-liner install:
+One-liner install (Linux/macOS):
   curl -fL https://raw.githubusercontent.com/
     aakashjabraham-hue/verify-code/main/verify-code \\
     -o ~/.local/bin/verify-code && chmod +x ~/.local/bin/verify-code
-""",
+
+One-liner install (Windows PowerShell):
+  powershell -Command "iwr -Uri 'https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code' -OutFile \"$env:APPDATA/verify-code/verify-code.py\"; python \"$env:APPDATA/verify-code/verify-code.py\" install"
+"""
     )
     p.add_argument("cmd", nargs="?", default="run",
-                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version"],
-                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version")
+                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version", "history"],
+                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version | history")
     p.add_argument("--minutes", type=int, default=10,
                    help="lookback window in minutes (default 10)")
     p.add_argument("--interval", type=int, default=15,
@@ -2213,6 +2285,8 @@ One-liner install:
             print(c("  ✅  Calendar authorization complete!", Style.GREEN, Style.BOLD))
     elif args.cmd == "version":
         print(c(f"  verify-code v{__version__}", Style.GREEN, Style.BOLD))
+    elif args.cmd == "history":
+        history_cmd()
     else:
         run(args)
 
