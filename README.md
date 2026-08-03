@@ -41,6 +41,9 @@ verify-code update
 
 # View copied code history
 verify-code history
+
+# Launch the web dashboard (subscriptions, codes, events)
+verify-code dashboard
 ```
 
 ## Features
@@ -109,6 +112,7 @@ verify-code history
 | `verify-code uninstall` | Remove everything (script, config, data, service) |
 | `verify-code auth` | (Re-)authenticate Google Calendar |
 | `verify-code version` | Show the installed version |
+| `verify-code dashboard` | Launch a local web dashboard in your browser |
 | `verify-code daemon --secure --secure-timeout 15` | Daemon with auto-erase after 15s |
 
 ## Options
