@@ -68,7 +68,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.3.5"
+__version__ = "2.3.6"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
