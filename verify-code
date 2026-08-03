@@ -2911,7 +2911,8 @@ def daemon_run(args):
           f"  |  Known-senders: {'yes' if args.known_senders else 'no'}"
           f"  |  Calendar: {'yes' if have_calendar else 'no'}"
           f"  |  Subs: {'yes' if args.subscriptions else 'no'}"
-          f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}")
+          f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}"
+          f"  |  Mode: {'IDLE' if args.idle else 'poll'}")
     if have_calendar:
         print(f"     Calendar min confidence: {args.cal_threshold}%")
     print(f"     Last UID: {last_uid}", flush=True)
@@ -2919,17 +2920,20 @@ def daemon_run(args):
     while True:
         try:
             con = connect(creds)
-            has_idle = supports_idle(con) and not args.no_idle
-            if has_idle:
+            use_idle = args.idle and supports_idle(con)
+            if use_idle:
                 print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('IMAP IDLE', Style.CYAN)} mode active.", flush=True)
             else:
                 print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('Polling', Style.DIM)} mode ({interval}s).", flush=True)
 
             while True:
-                if has_idle:
+                if use_idle:
                     res = wait_for_code_idle(con, window, since_uid=last_uid,
                                              known_senders_only=args.known_senders,
                                              idle_timeout=interval)
+                    if not res:
+                        # Safety: don't tight-loop if IDLE returns nothing
+                        time.sleep(interval)
                 else:
                     res = find_newest_code(con, window, since_uid=last_uid,
                                            known_senders_only=args.known_senders)
@@ -3563,7 +3567,6 @@ Examples:
   verify-code scan --subscriptions  # Scan for subscriptions
   verify-code daemon             # Background: watch, copy, calendar
   verify-code daemon --subscriptions  # Daemon + subscription tracking
-  verify-code daemon --no-idle   # Force polling
   verify-code subscriptions      # View tracked subscriptions
   verify-code dashboard          # Launch web dashboard in browser
   verify-code install            # Install to ~/.local/bin + systemd service
@@ -3593,8 +3596,8 @@ One-liner install (Windows PowerShell):
                    help="daemon poll/IDLE timeout in seconds (default 15)")
     p.add_argument("--known-senders", action="store_true",
                    help="only extract from known verification senders")
-    p.add_argument("--no-idle", action="store_true",
-                   help="disable IMAP IDLE, force polling")
+    p.add_argument("--idle", action="store_true",
+                   help="enable IMAP IDLE for instant notification (experimental; default: polling)")
     p.add_argument("--dry-run", action="store_true",
                    help="show what would be done; no clipboard or calendar action")
     p.add_argument("--calendar", action="store_true",

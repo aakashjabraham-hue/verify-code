@@ -105,7 +105,7 @@ verify-code dashboard
 | `verify-code scan --subscriptions` | Scan inbox and detect subscriptions |
 | `verify-code subscriptions` | View all tracked subscriptions with warnings and spending totals |
 | `verify-code history` | Show the last 10 copied codes |
-| `verify-code daemon` | Background: watches inbox, auto-copies, auto-adds events |
+| `verify-code daemon` | Background: polls inbox, auto-copies codes, auto-adds events |
 | `verify-code daemon --subscriptions` | Daemon + subscription tracking with desktop notifications |
 | `verify-code install` | Download latest + install to PATH + auto-start service |
 | `verify-code update` | Check for updates; only downloads if newer version exists |
@@ -119,9 +119,9 @@ verify-code dashboard
 
 ```
 --minutes MIN           Lookback window in minutes (default: 10)
---interval SEC          Daemon poll/IDLE timeout interval (default: 15)
+--interval SEC          Daemon poll interval in seconds (default: 15)
 --known-senders         Only extract from trusted senders (80+ known)
---no-idle               Force polling even if server supports IMAP IDLE
+--idle                  Enable IMAP IDLE for instant notification (experimental)
 --calendar              Enable Google Calendar integration (daemon mode)
 --cal-threshold N       Minimum confidence % for calendar events (default: 50)
 --subscriptions         Enable subscription tracking (detect plans, renewals, trials)
