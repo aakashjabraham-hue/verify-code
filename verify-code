@@ -68,7 +68,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.3.1"
+__version__ = "2.3.3"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -1466,18 +1466,20 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
     now = datetime.datetime.now(datetime.timezone.utc)
     uids = []
     try:
-        typ, data = con.search(None, "X-GM-RAW", f"newer_than:{int(window.total_seconds() // 60)}m")
+        # Use UID SEARCH for proper UID-based tracking
+        typ, data = con.uid('SEARCH', None, "X-GM-RAW", f"newer_than:{int(window.total_seconds() // 60)}m")
         if typ == "OK" and data and data[0]:
             uids = data[0].split()
-    except imaplib.IMAP4.error:
+    except (imaplib.IMAP4.error, AttributeError):
         uids = []
     if not uids:
         since = (now - window).strftime("%d-%b-%Y")
         try:
-            typ, data = con.search(None, "SINCE", since)
+            # Fallback: use UID SEARCH with SINCE (works on all providers)
+            typ, data = con.uid('SEARCH', None, "SINCE", since)
             if typ == "OK" and data and data[0]:
                 uids = data[0].split()
-        except imaplib.IMAP4.error:
+        except (imaplib.IMAP4.error, AttributeError):
             pass
     if not uids:
         return None
@@ -1488,7 +1490,7 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             continue
         uid_s = str(uid_int)
         try:
-            typ, data = con.fetch(uid_s, "(BODY.PEEK[HEADER])")
+            typ, data = con.uid('FETCH', uid_s, "(BODY.PEEK[HEADER])")
             if typ != "OK":
                 continue
             head = email.message_from_bytes(data[0][1])
@@ -1507,7 +1509,7 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             if age > window:
                 continue
 
-            typ, data = con.fetch(uid_s, "(BODY.PEEK[])")
+            typ, data = con.uid('FETCH', uid_s, "(BODY.PEEK[])")
             if typ != "OK":
                 continue
             msg = email.message_from_bytes(data[0][1])
@@ -1527,28 +1529,49 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
                 "events": events,
                 "body": body,
             }
-        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError):
+        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, IndexError):
             continue
     return None
 
 
 def wait_for_code_idle(con, window, since_uid=0, known_senders_only=False, idle_timeout=1200):
-    """Use IMAP IDLE to wait for new mail, then check for a code/event."""
-    while True:
-        try:
-            typ, data = con.idle()
-            if typ != "OK":
-                return None
-            now = time.time()
-            con.settimeout(idle_timeout)
-            con.idle()
-            time.sleep(0.5)
-            typ, data = con.idle()
-            res = find_newest_code(con, window, since_uid, known_senders_only)
-            if res:
-                return res
-        except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, AttributeError):
+    """Use IMAP IDLE to wait for new mail, then check for a code/event.
+
+    Falls back to polling if IDLE fails or times out.
+    """
+    try:
+        con.send(b"IDLE\r\n")
+        # Read the continuation: "+ idling"
+        # We expect a single "+" line
+        resp = con.readline()
+        if not resp or not resp.startswith(b"+"):
             return None
+
+        # Wait for server notification (blocking, with timeout)
+        con.settimeout(idle_timeout)
+        try:
+            # Block until the server sends something (new mail arrived)
+            # This is the actual IDLE wait — it blocks until EXISTS
+            line = con.readline()
+        except socket.timeout:
+            # Timeout — send DONE and check for new mail anyway
+            pass
+        except OSError:
+            return None
+
+        # Send DONE to exit IDLE mode
+        con.send(b"DONE\r\n")
+        # Read the tagged response (may be garbage if we timed out)
+        con.settimeout(5)
+        try:
+            con.readline()
+        except Exception:
+            pass
+
+        # Now check for new mail
+        return find_newest_code(con, window, since_uid, known_senders_only)
+    except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, AttributeError):
+        return None
 
 
 def supports_idle(con):
