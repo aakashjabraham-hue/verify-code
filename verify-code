@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify-code v2.3 — grab codes, find events, track subscriptions, add to calendar.
+verify-code v2.3.5 — grab codes, find events, track subscriptions, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
@@ -68,7 +68,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.3.4"
+__version__ = "2.3.5"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -231,7 +231,6 @@ KNOWN_SENDERS = {
 }
 
 # ── Code extraction regexes ────────────────────────────────────────────
-# Common code patterns seen in 2FA emails
 RE_EXPLICIT = re.compile(
     r"(?:verification|confirm(?:ation)?|otp|one[- ]?time|security|login|log[- ]?in|"
     r"sign[- ]?in|signup|sign[- ]?up|activate|access|2fa|two[- ]?factor|account|"
@@ -240,20 +239,11 @@ RE_EXPLICIT = re.compile(
     r"(?=[A-Za-z0-9-]*\d)([A-Za-z0-9]{3,8}(?:[- ][A-Za-z0-9]{3,8})?)",
     re.I,
 )
-
-# Alphanumeric codes like ABC-123 or A1B2C3
 RE_ALPHANUM = re.compile(r"\b([A-Z0-9]{2,8}(?:-|_)?[A-Z0-9]{2,8})\b")
-
-# Grouped 3+3 digits (e.g. "123 456" or "123-456")
 RE_GROUPED = re.compile(r"\b([0-9]{3}[ -][0-9]{3})\b")
-
-# Bare 5-8 digit codes
 RE_PLAIN_STRICT = re.compile(r"\b([0-9]{5,8})\b")
-
-# Bare 4-digit codes — ONLY with strong context
 RE_PLAIN_4 = re.compile(r"\b([0-9]{4})\b")
 
-# Context words that make a code plausible
 CONTEXT_WORDS = re.compile(
     r"verif|confirm|otp|code|security|log[- ]?in|sign[- ]?in|activate|2fa|"
     r"two[- ]?factor|one[- ]?time|one-time|pin|token|authenticator|"
@@ -262,11 +252,6 @@ CONTEXT_WORDS = re.compile(
 )
 
 # ── Date/time extraction patterns ──────────────────────────────────────
-# These patterns look for structured event info in email bodies
-
-# Pattern: date/time in various formats
-# Matches: "on June 15", "Date: June 15", "June 15, 2026 at 2:30 PM",
-# "Friday, August 14, 2026", "Departure: July 20, 2026 at 6:45 AM"
 RE_DATE_FULL = re.compile(
     r"(?:(?:on|for|date|time|when|departure|arrival|check[- ]?in|checkout|"
     r"starts|start|begins|begin|scheduled|confirmed|reserved)\s*[:]?\s*)?"
@@ -283,8 +268,6 @@ RE_DATE_FULL = re.compile(
     r")?",
     re.I,
 )
-
-# Pattern: "[Month] [Day], [Year]" without day-of-week
 RE_DATE_MONTH_DAY = re.compile(
     r"(?:(?:on|for|date|time|when|departure|arrival|check[- ]?in|checkout|"
     r"starts|start|begins|begin|scheduled|confirmed|reserved)\s*[:]?\s*)?"
@@ -299,22 +282,13 @@ RE_DATE_MONTH_DAY = re.compile(
     r")?",
     re.I,
 )
-
-# Pattern: specific appointment/booking phrases
-# Not used as a standalone regex (concept folded into EVENT_KEYWORDS)
-
-# Pattern: flight codes
 RE_FLIGHT = re.compile(r"\b([A-Z]{2}\d{1,4})\b")
-
-# Pattern: times like "2:30 PM", "14:30", "2pm"
 RE_TIME = re.compile(
     r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)"
     r"(?:\s*(?:to|-|–|until)\s*"
     r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?))?",
     re.I,
 )
-
-# Pattern: date-like strings in various formats
 RE_DATE_ISO = re.compile(
     r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})"
 )
@@ -322,7 +296,6 @@ RE_DATE_US = re.compile(
     r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
 )
 
-# ── Event type detection ───────────────────────────────────────────────
 EVENT_KEYWORDS = {
     "flight": ["flight", "departure", "boarding", "gate", "airline", "airport", "terminal",
                "seat", "confirmation", "itinerary", "e-ticket", "eticket"],
@@ -338,6 +311,8 @@ EVENT_KEYWORDS = {
                  "estimated", "tracking"],
 }
 
+# ── Global state for secure clipboard ───────────────────────────────────
+_CLIPBOARD_GEN = 0
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
@@ -431,7 +406,6 @@ def log_event(sender, subject, code=None, event=None):
 
 
 def _subscription_key(sub: dict) -> str:
-    """Generate a unique key for a subscription to prevent duplicates."""
     service = sub.get("service", "unknown")
     plan = sub.get("plan", "")
     amount = sub.get("amount", "")
@@ -439,7 +413,6 @@ def _subscription_key(sub: dict) -> str:
 
 
 def load_subscriptions() -> list[dict]:
-    """Load tracked subscriptions from disk."""
     try:
         with open(SUBSCRIPTIONS_FILE) as f:
             return json.load(f)
@@ -448,22 +421,18 @@ def load_subscriptions() -> list[dict]:
 
 
 def save_subscription(sub: dict):
-    """Add or update a subscription in the persistent list."""
     subs = load_subscriptions()
     key = _subscription_key(sub)
     existing = False
     for i, s in enumerate(subs):
         if _subscription_key(s) == key:
-            # Update: merge new data with existing (keep older dates, prefer newer info)
             subs[i] = {**s, **sub}
-            # Keep the earliest next_billing we found
             if s.get("next_billing") and sub.get("next_billing"):
                 subs[i]["next_billing"] = min(s["next_billing"], sub["next_billing"])
             existing = True
             break
     if not existing:
         subs.append(sub)
-    # Keep only latest 200 subscriptions
     subs = subs[-200:]
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -477,14 +446,13 @@ def save_subscription(sub: dict):
 def notify(title, body):
     if IS_WINDOWS:
         try:
-            # PowerShell toast notification
             ps_script = f'''
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-$textNodes = $template.GetElementsByTagName("text")
-$textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) > $null
-$textNodes.Item(1).AppendChild($template.CreateTextNode("{body.replace('"', "'")}")) > $null
-$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+ $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+ $textNodes = $template.GetElementsByTagName("text")
+ $textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) > $null
+ $textNodes.Item(1).AppendChild($template.CreateTextNode("{body.replace('"', "'")}")) > $null
+ $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("verify-code").Show($toast)
 '''
             subprocess.run(["powershell", "-Command", ps_script], capture_output=True, timeout=10)
@@ -525,7 +493,6 @@ def copy_clipboard(text):
                 res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
                 if res.returncode == 0:
                     return backend
-                # Tool exists but failed (e.g. no Wayland socket) — try next backend
                 continue
         except (subprocess.TimeoutExpired, OSError):
             continue
@@ -533,7 +500,6 @@ def copy_clipboard(text):
 
 
 def erase_clipboard():
-    """Erase clipboard contents by copying empty/whitespace."""
     for cmd in [["powershell", "-Command", "$input | Set-Clipboard"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]]:
         try:
             if cmd[0] == "powershell":
@@ -550,18 +516,25 @@ def erase_clipboard():
 
 def secure_copy_clipboard(text, timeout=30):
     """Copy code to clipboard and schedule auto-erase after `timeout` seconds."""
+    global _CLIPBOARD_GEN
     backend = copy_clipboard(text)
     if timeout > 0:
+        _CLIPBOARD_GEN += 1
+        my_gen = _CLIPBOARD_GEN
+        
         def _erase():
             time.sleep(timeout)
-            erase_clipboard()
+            # Only erase if no newer code has been copied!
+            if my_gen == _CLIPBOARD_GEN:
+                erase_clipboard()
+                
         t = threading.Thread(target=_erase, daemon=True)
         t.start()
     return backend
 
 
 def get_plain(msg):
-    """Extract plain text from email, with proper HTML-to-text conversion."""
+    """Extract plain text from email, with proper charset handling."""
     if msg.is_multipart():
         plain = html = None
         for part in msg.walk():
@@ -570,14 +543,22 @@ def get_plain(msg):
                 try:
                     payload = part.get_payload(decode=True)
                     if payload:
-                        plain = payload.decode("utf-8", "replace")
+                        charset = part.get_content_charset() or "utf-8"
+                        try:
+                            plain = payload.decode(charset, errors="replace")
+                        except LookupError:
+                            plain = payload.decode("utf-8", errors="replace")
                 except Exception:
                     pass
             elif ct == "text/html" and html is None:
                 try:
                     payload = part.get_payload(decode=True)
                     if payload:
-                        html = payload.decode("utf-8", "replace")
+                        charset = part.get_content_charset() or "utf-8"
+                        try:
+                            html = payload.decode(charset, errors="replace")
+                        except LookupError:
+                            html = payload.decode("utf-8", errors="replace")
                 except Exception:
                     pass
         if plain:
@@ -589,25 +570,23 @@ def get_plain(msg):
         body = msg.get_payload(decode=True)
         if body is None:
             return ""
-        return body.decode("utf-8", "replace")
+        charset = msg.get_content_charset() or "utf-8"
+        try:
+            return body.decode(charset, errors="replace")
+        except LookupError:
+            return body.decode("utf-8", errors="replace")
     except Exception:
         return str(msg)
 
 
 def html_to_text(html):
-    """Convert HTML email body to clean text for parsing."""
     text = html
-    # Remove style and script blocks entirely
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
-    # Remove comments
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
-    # Replace common block elements with newlines
     text = re.sub(r"</?(?:div|p|br|tr|li|h[1-6]|blockquote|section|article|header|footer)[^>]*>",
                   "\n", text, flags=re.I)
-    # Replace remaining tags with spaces
     text = re.sub(r"<[^>]+>", " ", text)
-    # Decode entities
     entities = {
         "&nbsp;": " ", "&amp;": "&", "&gt;": ">", "&lt;": "<",
         "&quot;": '"', "&apos;": "'", "&#160;": " ", "&#39;": "'",
@@ -615,7 +594,6 @@ def html_to_text(html):
     }
     for a, b in entities.items():
         text = text.replace(a, b)
-    # Collapse whitespace
     text = re.sub(r"\n\s*\n", "\n", text)
     text = re.sub(r" +", " ", text)
     return text.strip()
@@ -647,15 +625,10 @@ def is_known_sender(sender: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════
 
 def extract_code(text, subject="", sender=""):
-    """Extract verification code from email text with confidence scoring.
-
-    Returns dict with code, confidence (0-100), and method or None.
-    """
     combined = f"{subject} {sender} {text[:2000]}"
     has_context = bool(CONTEXT_WORDS.search(combined))
     known_sender = is_known_sender(sender)
 
-    # Priority 1: explicit OTP label right next to digits (highest accuracy)
     m = RE_EXPLICIT.search(text)
     if m:
         raw = m.group(1)
@@ -663,21 +636,18 @@ def extract_code(text, subject="", sender=""):
         if len(cleaned) >= 4:
             return {"code": cleaned, "confidence": 95, "method": "explicit_label"}
 
-    # Priority 2: grouped 3+3 digits (common in GitHub, Google)
     if has_context or known_sender:
         m = RE_GROUPED.search(text)
         if m:
             cleaned = m.group(1).replace(" ", "").replace("-", "")
             return {"code": cleaned, "confidence": 88, "method": "grouped_3_3"}
 
-    # Priority 3: alphanumeric codes from known senders
     if known_sender and has_context:
         for m in RE_ALPHANUM.finditer(text):
             code = m.group(1)
             if len(code) >= 4 and len(code) <= 12:
                 return {"code": code, "confidence": 80, "method": "alphanumeric"}
 
-    # Priority 4: bare 5-8 digit codes
     m = RE_PLAIN_STRICT.search(text)
     if m:
         score = 65 if known_sender else 45
@@ -685,11 +655,9 @@ def extract_code(text, subject="", sender=""):
             score += 15
         return {"code": m.group(1), "confidence": score, "method": "bare_digits"}
 
-    # Priority 5: bare 4-digit codes — ONLY with strong context + known sender
     if known_sender and has_context:
         m = RE_PLAIN_4.search(text)
         if m:
-            # Check that the code is near a context word in the body
             code = m.group(1)
             idx = text.find(code)
             nearby = text[max(0, idx - 80):idx + len(code) + 80]
@@ -704,25 +672,13 @@ def extract_code(text, subject="", sender=""):
 # ═══════════════════════════════════════════════════════════════════════
 
 def extract_datetime(text, subject="", sender=""):
-    """Extract date/time info from an email body.
-
-    Returns list of event dicts with:
-      - title: str
-      - start: ISO datetime string
-      - end: ISO datetime string (or None)
-      - location: str (or None)
-      - confidence: 0-100
-      - event_type: str
-      - source: str
-    """
     events = []
-    body = text[:5000]  # Look at first 5K chars
+    body = text[:5000]
     combined = f"{subject} {sender} {body}"
 
     if not DATEUTIL_AVAILABLE:
         return events
 
-    # --- Detect event type ---
     event_type = "event"
     body_lower = body.lower() + " " + subject.lower()
     type_scores = {}
@@ -733,9 +689,7 @@ def extract_datetime(text, subject="", sender=""):
     if type_scores:
         event_type = max(type_scores, key=type_scores.get)
 
-    # --- Extract title ---
     title = subject.strip()
-    # Clean up subject: remove common prefixes
     title_clean = re.sub(
         r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New)",
         "", title, flags=re.I
@@ -743,7 +697,6 @@ def extract_datetime(text, subject="", sender=""):
     if not title_clean:
         title_clean = event_type.capitalize()
 
-    # --- Extract location ---
     location = None
     loc_patterns = [
         re.compile(r"(?:at|in|location|venue|address)[:\s]+([A-Za-z0-9\s,.'\-]+?)(?:\.|$|\n)", re.I),
@@ -757,18 +710,15 @@ def extract_datetime(text, subject="", sender=""):
                 location = loc
                 break
 
-    # --- Search for dates ---
     now = datetime.datetime.now()
     found_dates = []
 
-    # Method 1: "on [date] at [time]" patterns (with day-of-week)
     for m in RE_DATE_FULL.finditer(body):
         date_str = m.group(1)
         time_str = m.group(2) if m.lastindex >= 2 and m.group(2) else None
         full_str = date_str
         if time_str:
             full_str += " " + time_str
-        # Strip trailing punctuation that might confuse dateparser
         full_str = full_str.rstrip(".,;:!?")
         try:
             dt = dateparser.parse(full_str, fuzzy=True, default=now)
@@ -777,7 +727,6 @@ def extract_datetime(text, subject="", sender=""):
         except (ValueError, TypeError):
             pass
 
-    # Method 1b: "[Month] [Day], [Year]" patterns (no day-of-week)
     seen_dates = set()
     for m in RE_DATE_MONTH_DAY.finditer(body):
         date_str = m.group(1)
@@ -789,7 +738,6 @@ def extract_datetime(text, subject="", sender=""):
         try:
             dt = dateparser.parse(full_str, fuzzy=True, default=now)
             if dt and dt > datetime.datetime(2000, 1, 1):
-                # Check not already found
                 key = dt.strftime("%Y%m%d%H%M")
                 if key not in seen_dates:
                     found_dates.append((dt, 80))
@@ -797,12 +745,10 @@ def extract_datetime(text, subject="", sender=""):
         except (ValueError, TypeError):
             pass
 
-    # Method 2: ISO dates (2024-07-15)
     for m in RE_DATE_ISO.finditer(body):
         try:
             dt = dateparser.parse(m.group(1), fuzzy=False)
             if dt:
-                # Check for time nearby
                 nearby = body[m.end():m.end() + 60]
                 time_m = RE_TIME.search(nearby)
                 if time_m:
@@ -815,15 +761,12 @@ def extract_datetime(text, subject="", sender=""):
         except (ValueError, TypeError):
             pass
 
-    # Method 3: US-style dates (7/15/2024)
     for m in RE_DATE_US.finditer(body):
-        # Only if it's actually a date (not just numbers)
         parts = m.group(1).replace("-", "/").split("/")
         if len(parts) == 3:
             try:
                 parts = [int(p) for p in parts]
                 if parts[0] <= 12 and parts[0] >= 1 and parts[1] <= 31 and parts[2] >= 2020:
-                    # Check for time nearby
                     nearby = body[m.end():m.end() + 60]
                     time_m = RE_TIME.search(nearby)
                     dt = datetime.datetime(parts[2], parts[0], parts[1])
@@ -839,17 +782,8 @@ def extract_datetime(text, subject="", sender=""):
             except (ValueError, TypeError):
                 pass
 
-    # Method 4: Fuzzy dateutil parsing of the email body
-    if not found_dates:
-        # Try to find the first meaningful date in the body
-        try:
-            dt = dateparser.parse(body, fuzzy=True, default=now)
-            if dt and dt > datetime.datetime(2000, 1, 1) and dt < now + datetime.timedelta(days=365):
-                found_dates.append((dt, 40))
-        except (ValueError, TypeError):
-            pass
+    # Removed Method 4 (Fuzzy dateutil parsing) to prevent massive CPU usage and false positives.
 
-    # Deduplicate and filter
     seen = set()
     unique_dates = []
     for dt, conf in found_dates:
@@ -858,16 +792,13 @@ def extract_datetime(text, subject="", sender=""):
             seen.add(key)
             unique_dates.append((dt, conf))
 
-    # Sort by confidence (highest first)
     unique_dates.sort(key=lambda x: -x[1])
 
     for dt, conf in unique_dates:
-        # Skip if it's too far in the past
         if dt < now - datetime.timedelta(days=1):
             continue
 
         end_dt = None
-        # Check for duration/end time nearby
         time_text = body[max(0, body.lower().find(dt.strftime("%B")) - 20):
                          body.lower().find(dt.strftime("%B")) + 120]
         range_m = re.search(
@@ -881,7 +812,6 @@ def extract_datetime(text, subject="", sender=""):
             except (ValueError, TypeError):
                 pass
 
-        # Default 1h duration if no end time found
         if end_dt is None:
             end_dt = dt + datetime.timedelta(hours=1)
 
@@ -903,7 +833,6 @@ def extract_datetime(text, subject="", sender=""):
 # Subscription Tracking
 # ═══════════════════════════════════════════════════════════════════════
 
-# Known subscription/receipt senders (domain → service name)
 SUBSCRIPTION_SENDERS = {
     "netflix.com": "Netflix", "mailer.netflix.com": "Netflix",
     "spotify.com": "Spotify", "message.spotify.com": "Spotify",
@@ -976,7 +905,7 @@ SUBSCRIPTION_SENDERS = {
     "washingtonpost.com": "Washington Post",
     "theatlantic.com": "The Atlantic",
     "economist.com": "The Economist",
-    "nintendo.com": "Nintendo Switch Online",
+    "nintendo.com": "Nintendo Switch Online"
     "playstation.com": "PlayStation Plus",
     "xbox.com": "Xbox Game Pass",
     "roblox.com": "Roblox Premium",
@@ -1019,8 +948,9 @@ RE_PLAN_NAME = re.compile(
 )
 
 # Regex to find dates near subscription keywords
+# (Fixed regex typo: removed the erroneous \\. which matched literal backslash + any char)
 RE_SUB_DATE = re.compile(
-    r"(?:on|by|before|after|for|date:|\\.)?\s*"
+    r"(?:on|by|before|after|for|date:)?\s*"
     r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?)",
@@ -1037,7 +967,6 @@ def _lookup_service_name(sender: str) -> str | None:
     domain = _sender_domain(sender)
     if domain in SUBSCRIPTION_SENDERS:
         return SUBSCRIPTION_SENDERS[domain]
-    # Try subdomain stripping
     parts = domain.split(".")
     for i in range(len(parts) - 1):
         candidate = ".".join(parts[i:])
@@ -1047,26 +976,10 @@ def _lookup_service_name(sender: str) -> str | None:
 
 
 def extract_subscription(text, subject="", sender="") -> dict | None:
-    """Extract subscription info from an email body.
-
-    Returns a dict with:
-      - service: str (friendly name)
-      - plan: str or None
-      - amount: str or None (e.g. "$14.99")
-      - billing_cycle: str or None (monthly/yearly/weekly)
-      - next_billing: str or None (ISO date)
-      - trial_end: str or None (ISO date)
-      - status: str (active/trial/cancelled)
-      - confidence: 0-100
-      - source: str
-      - sender: str
-      - subject: str
-    Returns None if no subscription info detected.
-    """
+    """Extract subscription info from an email body."""
     body = text[:5000]
     combined = f"{subject} {sender} {body}"
 
-    # Quick check: does this look subscription-related at all?
     if not SUBSCRIPTION_KEYWORDS.search(combined):
         return None
 
@@ -1075,7 +988,6 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     body_lower = body.lower() + " " + subject.lower()
 
-    # ── Detect status ──
     status = "active"
     if re.search(r"(?:trial|free trial|trial period|trial ends|trial ending)", combined, re.I):
         status = "trial"
@@ -1083,13 +995,11 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
                  r"cancel your|you cancelled|has been cancelled)", combined, re.I):
         status = "cancelled"
 
-    # ── Extract amount ──
     amount = None
     amt_matches = RE_AMOUNT.findall(body)
     if amt_matches:
         amount = f"${amt_matches[0]}"
 
-    # ── Extract billing cycle ──
     billing_cycle = None
     bc_m = RE_BILLING_CYCLE.search(body)
     if bc_m:
@@ -1103,16 +1013,12 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
         elif raw == "quarterly":
             billing_cycle = "quarterly"
 
-    # ── Extract plan name ──
     plan = None
-    # Pattern 1: "plan: [name]" or "plan [name]"
     plan_m = RE_PLAN_NAME.search(body)
     if plan_m:
         candidate = plan_m.group(1).strip()
-        # Filter out false positives (too long, looks like a sentence fragment)
         if len(candidate) < 30 and not re.search(r"(?:will|your|this|that|has|have|been|with|for|the|and|our|we|you|to|is|are|was|on|at|it|in)", candidate, re.I):
             plan = candidate
-    # Pattern 2: "the [Name] plan" or "your [Name] plan" or "[Name] Plan"
     if plan is None:
         plan_m2 = re.search(
             r"(?:the|your|our|this)\s+([A-Za-z][A-Za-z0-9\s.'\-+]{1,20}?)\s+"
@@ -1124,20 +1030,17 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
             if len(candidate) < 30:
                 plan = candidate
 
-    # ── Extract dates ──
     next_billing = None
     trial_end = None
 
     if DATEUTIL_AVAILABLE:
         now = datetime.datetime.now()
 
-        # Look for explicit dates near subscription keywords
         for m in RE_SUB_DATE.finditer(body):
             try:
                 dt = dateparser.parse(m.group(1), fuzzy=False, default=now)
                 if dt and dt > datetime.datetime(2000, 1, 1):
                     iso = dt.strftime("%Y-%m-%d")
-                    # Check context: is this a trial end or next billing?
                     ctx = body[max(0, m.start() - 60):m.end() + 60].lower()
                     if re.search(r"(?:trial ends|trial ending|trial period ends|"
                                  r"free trial ends|trial expires)", ctx):
@@ -1149,7 +1052,6 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
             except (ValueError, TypeError):
                 pass
 
-        # ISO dates
         for m in RE_SUB_DATE_ISO.finditer(body):
             try:
                 dt = dateparser.parse(m.group(1), fuzzy=False)
@@ -1163,7 +1065,6 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
             except (ValueError, TypeError):
                 pass
 
-        # US dates
         for m in RE_SUB_DATE_US.finditer(body):
             try:
                 parts = m.group(1).replace("-", "/").split("/")
@@ -1179,9 +1080,7 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
             except (ValueError, TypeError):
                 pass
 
-        # If nothing found, try fuzzy date parsing
         if next_billing is None and trial_end is None:
-            # Look for "renews on [date]" or "will be charged on [date]"
             for pat in [
                 re.compile(r"(?:renews|will renew|next renewal|next billing)[:\s]+"
                            r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
@@ -1202,7 +1101,6 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
                     except (ValueError, TypeError):
                         pass
 
-    # ── Compute confidence ──
     confidence = 0
     signals = 0
 
@@ -1222,10 +1120,9 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
         confidence += 10
         signals += 1
     if status == "trial":
-        confidence += 5  # trial status is a strong signal
+        confidence += 5
 
     if not known_sender and not amount:
-        # Generic subscription email, low confidence
         confidence = max(confidence, 15)
 
     if confidence < 20:
@@ -1233,12 +1130,8 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     confidence = min(confidence, 98)
 
-    # ── Build result ──
-    # If no known service, try to guess from subject
     if service_name is None:
-        # Try to extract a service name from the sender domain
         domain = _sender_domain(sender)
-        # Clean up common prefixes
         service_name = domain.replace("mail.", "").replace("message.", "") \
             .replace("noreply.", "").replace("accounts.", "") \
             .replace("account.", "").replace("e.", "") \
@@ -1261,7 +1154,6 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
 
 def format_subscription(sub, warn=False) -> str:
-    """Format a subscription dict into a human-readable line."""
     parts = [c(sub["service"], Style.BOLD, Style.CYAN) if not warn else c(sub["service"], Style.BOLD, Style.YELLOW)]
     if sub["plan"]:
         parts.append(f"({sub['plan']})")
@@ -1275,14 +1167,12 @@ def format_subscription(sub, warn=False) -> str:
         parts.append(c(f"⚠ trial ends {sub['trial_end']}", Style.YELLOW) if warn else f"trial ends {sub['trial_end']}")
     if sub["status"] == "cancelled":
         parts.append(c("❌ cancelled", Style.RED, Style.BOLD))
-    # Confidence bar
     conf_bar = "█" * (sub["confidence"] // 10) + "░" * (10 - sub["confidence"] // 10)
     parts.append(c(f"({conf_bar} {sub['confidence']}%)", Style.DIM))
     return "  ".join(parts)
 
 
 def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -> list[dict]:
-    """Check which subscriptions need warnings (about to renew or trial ending)."""
     now = datetime.datetime.now().date()
     warnings = []
     for sub in subscriptions:
@@ -1312,7 +1202,6 @@ def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -
 CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
 def get_calendar_service():
-    """Get an authenticated Google Calendar service."""
     if not GOOGLE_AVAILABLE:
         return None
 
@@ -1325,11 +1214,9 @@ def get_calendar_service():
         except Exception:
             pass
 
-    # If no valid credentials, try to refresh
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
-            # Save refreshed token
             with open(CAL_TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
             _chmod_600(CAL_TOKEN_FILE)
@@ -1347,7 +1234,6 @@ def get_calendar_service():
 
 
 def calendar_auth_flow():
-    """Run the interactive Google Calendar OAuth flow."""
     if not GOOGLE_AVAILABLE:
         print(c("  ✗  Google Calendar support requires:", Style.RED))
         print("     pip install google-auth-oauthlib google-api-python-client")
@@ -1394,8 +1280,6 @@ def calendar_auth_flow():
             client_config, CAL_SCOPES,
             redirect_uri="http://localhost:8080/"
         )
-
-        # Start a local server to catch the redirect
         creds = flow.run_local_server(
             port=8080,
             host="localhost",
@@ -1403,13 +1287,11 @@ def calendar_auth_flow():
             success_message="✅ verify-code is now authorized! You can close this tab.",
         )
 
-        # Save token
         token_data = json.loads(creds.to_json())
         with open(CAL_TOKEN_FILE, "w") as f:
             json.dump(token_data, f, indent=2)
         _chmod_600(CAL_TOKEN_FILE)
 
-        # Save client config for re-auth
         with open(CAL_CLIENT_FILE, "w") as f:
             json.dump(client_config, f, indent=2)
         _chmod_600(CAL_CLIENT_FILE)
@@ -1432,10 +1314,23 @@ def add_event_to_calendar(event):
         return False
 
     try:
+        # FIX: Use local system timezone instead of hardcoded America/Chicago
+        local_tz = datetime.datetime.now().astimezone().tzinfo
+        
+        start_iso = event["start"]
+        if "+" not in start_iso and "Z" not in start_iso:
+            start_dt = datetime.datetime.fromisoformat(start_iso).replace(tzinfo=local_tz)
+            start_iso = start_dt.isoformat()
+            
+        end_iso = event["end"]
+        if "+" not in end_iso and "Z" not in end_iso:
+            end_dt = datetime.datetime.fromisoformat(end_iso).replace(tzinfo=local_tz)
+            end_iso = end_dt.isoformat()
+
         event_body = {
             "summary": event["title"],
-            "start": {"dateTime": event["start"], "timeZone": "America/Chicago"},
-            "end": {"dateTime": event["end"], "timeZone": "America/Chicago"},
+            "start": {"dateTime": start_iso},
+            "end": {"dateTime": end_iso},
         }
         if event.get("location"):
             event_body["location"] = event["location"]
@@ -1462,35 +1357,37 @@ def connect(creds):
 
 
 def find_newest_code(con, window, since_uid=0, known_senders_only=False):
-    """Return dict with code, sender, subject, age, uid, confidence, method, events."""
+    """Return dict with code, sender, subject, age, uid, confidence, method, events, max_uid_seen."""
     now = datetime.datetime.now(datetime.timezone.utc)
     uids = []
+    
+    # FIX: Removed the X-GM-RAW newer_than:10m search because 'm' means months in Gmail search syntax.
+    # We rely entirely on the standard IMAP SINCE date search, which is safe and accurate.
+    since = (now - window).strftime("%d-%b-%Y")
     try:
-        # Use UID SEARCH for proper UID-based tracking
-        typ, data = con.uid('SEARCH', None, "X-GM-RAW", f"newer_than:{int(window.total_seconds() // 60)}m")
+        typ, data = con.uid('SEARCH', None, "SINCE", since)
         if typ == "OK" and data and data[0]:
             uids = data[0].split()
     except (imaplib.IMAP4.error, AttributeError):
-        uids = []
-    if not uids:
-        since = (now - window).strftime("%d-%b-%Y")
-        try:
-            # Fallback: use UID SEARCH with SINCE (works on all providers)
-            typ, data = con.uid('SEARCH', None, "SINCE", since)
-            if typ == "OK" and data and data[0]:
-                uids = data[0].split()
-        except (imaplib.IMAP4.error, AttributeError):
-            pass
+        pass
+        
     if not uids:
         return None
 
-    for uid in reversed(uids):
+    # FIX: Filter out seen UIDs instead of skipping inside the loop
+    new_uids = [u for u in uids if int(u) > since_uid]
+    if not new_uids:
+        return None
+
+    best_result = None
+    newest_uid_seen = since_uid
+
+    # FIX: Walk ALL new UIDs (newest to oldest) to find the best code, instead of returning on the first email.
+    for uid in reversed(new_uids):
         uid_int = int(uid)
-        if uid_int <= since_uid:
-            continue
-        uid_s = str(uid_int)
+        newest_uid_seen = max(newest_uid_seen, uid_int)
         try:
-            typ, data = con.uid('FETCH', uid_s, "(BODY.PEEK[HEADER])")
+            typ, data = con.uid('FETCH', uid, "(BODY.PEEK[HEADER])")
             if typ != "OK":
                 continue
             head = email.message_from_bytes(data[0][1])
@@ -1509,7 +1406,7 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             if age > window:
                 continue
 
-            typ, data = con.uid('FETCH', uid_s, "(BODY.PEEK[])")
+            typ, data = con.uid('FETCH', uid, "(BODY.PEEK[])")
             if typ != "OK":
                 continue
             msg = email.message_from_bytes(data[0][1])
@@ -1518,7 +1415,7 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             result = extract_code(body, subject, sender)
             events = extract_datetime(body, subject, sender) if DATEUTIL_AVAILABLE else []
 
-            return {
+            candidate = {
                 "code": result["code"] if result else None,
                 "confidence": result["confidence"] if result else 0,
                 "method": result["method"] if result else None,
@@ -1528,50 +1425,25 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
                 "uid": uid,
                 "events": events,
                 "body": body,
+                "max_uid_seen": newest_uid_seen
             }
+
+            # Return immediately if we find a code (since we are newest -> oldest)
+            if result and result.get("code"):
+                return candidate
+                
+            # Fallback if no code is found, keep track of the newest email to process events/subs
+            if best_result is None:
+                best_result = candidate
         except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, IndexError):
             continue
-    return None
 
-
-def wait_for_code_idle(con, window, since_uid=0, known_senders_only=False, idle_timeout=1200):
-    """Use IMAP IDLE to wait for new mail, then check for a code/event.
-
-    Falls back to polling if IDLE fails or times out.
-    """
-    try:
-        con.send(b"IDLE\r\n")
-        # Read the continuation: "+ idling"
-        # We expect a single "+" line
-        resp = con.readline()
-        if not resp or not resp.startswith(b"+"):
-            return None
-
-        # Wait for server notification (blocking, with timeout)
-        con.settimeout(idle_timeout)
-        try:
-            # Block until the server sends something (new mail arrived)
-            # This is the actual IDLE wait — it blocks until EXISTS
-            line = con.readline()
-        except socket.timeout:
-            # Timeout — send DONE and check for new mail anyway
-            pass
-        except OSError:
-            return None
-
-        # Send DONE to exit IDLE mode
-        con.send(b"DONE\r\n")
-        # Read the tagged response (may be garbage if we timed out)
-        con.settimeout(5)
-        try:
-            con.readline()
-        except Exception:
-            pass
-
-        # Now check for new mail
-        return find_newest_code(con, window, since_uid, known_senders_only)
-    except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, AttributeError):
-        return None
+    if best_result is None:
+        # Advance last_uid even if we couldn't fetch anything, to prevent infinite loops
+        return {"uid": str(newest_uid_seen), "max_uid_seen": newest_uid_seen, "code": None,
+                "confidence": 0, "method": None, "sender": "", "subject": "", "age": None,
+                "events": [], "body": ""}
+    return best_result
 
 
 def supports_idle(con):
@@ -1594,7 +1466,6 @@ def setup():
     print()
     time.sleep(0.5)
 
-    # ── Check for existing credentials ──
     existing_creds = None
     if os.path.exists(CRED_FILE):
         try:
@@ -1616,7 +1487,6 @@ def setup():
             password = existing_creds["password"]
             print(c(f"  ✅  Using {existing_label} credentials for {email_addr}", Style.GREEN))
             print()
-            # Jump to the Calendar step
             print(c("  ── Step 3: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
             print()
             print("  I can also extract dates/times from emails (flights, appointments,")
@@ -1638,7 +1508,6 @@ def setup():
                     print(c("  ✅  Keeping existing Calendar connection.", Style.GREEN))
                 else:
                     print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
-            # Jump to clipboard
             print()
             print(c("  ── Step 4: Clipboard Tool ──", Style.CYAN, Style.BOLD))
             print()
@@ -1667,7 +1536,6 @@ def setup():
                             print(c("  ✗  Installation failed. Install manually.", Style.RED))
                 else:
                     print("  On Windows, PowerShell Set-Clipboard is used automatically.")
-            # Jump to secure mode
             print()
             print(c("  ── Step 5: Secure Mode (optional) ──", Style.CYAN, Style.BOLD))
             print()
@@ -1695,10 +1563,8 @@ def setup():
                     print(c("  ❌  Secure mode disabled.", Style.YELLOW))
             else:
                 secure_seconds = current_timeout if current_secure else 0
-            # Re-save with all settings
             save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                        provider=provider, cal_token=cal_ok, secure=secure_seconds > 0, secure_timeout=secure_seconds)
-            # Skip to summary
             print()
             print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
             print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
@@ -1719,7 +1585,6 @@ def setup():
             print("  •  verify-code version      — show installed version")
             if secure_seconds > 0:
                 print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
-            # ── Install to PATH ──
             print()
             print(c("  ── Install to PATH ──", Style.CYAN, Style.BOLD))
             print()
@@ -1743,7 +1608,6 @@ def setup():
             print()
             return
 
-    # ── Step 1: Provider ──
     print(c("  ── Step 1: Email Provider ──", Style.CYAN, Style.BOLD))
     print()
     print("  Which email provider do you use?")
@@ -1764,7 +1628,6 @@ def setup():
     print()
     time.sleep(0.3)
 
-    # ── Step 2: Credentials ──
     print(c("  ── Step 2: Email Credentials ──", Style.CYAN, Style.BOLD))
     print()
     print(f"  I'll watch your {provider_info['label']} inbox for verification codes.")
@@ -1786,7 +1649,6 @@ def setup():
                provider=provider)
     time.sleep(0.3)
 
-    # ── Step 3: Test connection ──
     print()
     print(c("  ── Step 3: Testing Connection ──", Style.CYAN, Style.BOLD))
     print()
@@ -1803,7 +1665,6 @@ def setup():
         return
     time.sleep(0.3)
 
-    # ── Step 4: Google Calendar ──
     print()
     print(c("  ── Step 4: Google Calendar (optional) ──", Style.CYAN, Style.BOLD))
     print()
@@ -1827,7 +1688,6 @@ def setup():
         else:
             print(c("  Skipped. You can set it up later with: verify-code auth", Style.DIM))
 
-    # ── Step 5: Clipboard ──
     print()
     print(c("  ── Step 5: Clipboard Tool ──", Style.CYAN, Style.BOLD))
     print()
@@ -1857,7 +1717,6 @@ def setup():
         else:
             print("  On Windows, PowerShell Set-Clipboard is used automatically.")
 
-    # ── Step 6: Secure Mode ──
     print()
     print(c("  ── Step 6: Secure Mode (optional) ──", Style.CYAN, Style.BOLD))
     print()
@@ -1874,11 +1733,9 @@ def setup():
         except ValueError:
             secure_seconds = 30
         print(c(f"  ✅  Secure mode: clipboard will be erased after {secure_seconds}s", Style.GREEN))
-        # Re-save with secure mode
         save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                    provider=provider, cal_token=cal_ok, secure=True, secure_timeout=secure_seconds)
 
-    # ── Summary ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
@@ -1900,7 +1757,6 @@ def setup():
     if secure_seconds > 0:
         print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
 
-    # ── Step 7: Install to PATH ──
     print()
     print(c("  ── Step 7: Install to PATH ──", Style.CYAN, Style.BOLD))
     print()
@@ -1943,7 +1799,7 @@ def run(args):
             pass
         con.logout()
 
-    if not res:
+    if not res or not res.get("code"):
         print(f"No verification code found in the last {args.minutes} minutes.")
         if args.known_senders:
             print("Tip: remove --known-senders to check all senders (higher FP risk).")
@@ -1965,7 +1821,6 @@ def run(args):
         return
 
     if res["code"]:
-        # Check if secure mode is enabled in credentials
         secure_timeout = 0
         try:
             creds_data = load_creds()
@@ -1997,7 +1852,6 @@ def run(args):
             print(f"  📅  {len(res['events'])} event(s) found in this email.")
         print()
 
-    # Handle events
     if res["events"] and args.calendar and not args.dry_run:
         calendar_service = get_calendar_service()
         if calendar_service:
@@ -2014,7 +1868,6 @@ def run(args):
             if res["events"]:
                 print(c("  ⚠  Calendar not authorized. Run: verify-code auth", Style.YELLOW))
 
-    # Handle subscriptions (one-shot mode)
     if args.subscriptions and res.get("body") and not args.dry_run:
         sub = extract_subscription(res["body"], res["subject"], res["sender"])
         if sub:
@@ -2046,7 +1899,6 @@ def run(args):
 
 
 def history_cmd():
-    """Show the last 10 copied verification codes."""
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   📋  verify-code history                ║", Style.CYAN, Style.BOLD))
@@ -2065,7 +1917,6 @@ def history_cmd():
         print(c(f"  ✗  Could not read history: {e}", Style.RED))
         return
 
-    # Filter for CODE entries, take last 10
     code_entries = [l.strip() for l in lines if " CODE " in l]
     if not code_entries:
         print(c("  No codes have been copied yet.", Style.DIM))
@@ -2073,7 +1924,6 @@ def history_cmd():
         return
 
     for entry in code_entries[-10:]:
-        # Parse: [2026-08-02 17:00:00] CODE sender=... subject=... code=...
         m = re.match(r"\[(.*?)\] CODE sender=(.*?) subject=(.*?) code=(.*)", entry)
         if m:
             ts, sender, subject, code = m.groups()
@@ -2091,7 +1941,6 @@ def history_cmd():
 
 
 def subscriptions_cmd(args):
-    """Show tracked subscriptions and upcoming warnings."""
     subs = load_subscriptions()
 
     print()
@@ -2108,7 +1957,6 @@ def subscriptions_cmd(args):
         print()
         return
 
-    # ── Check for warnings ──
     warn_days = args.warn_days if args.warn_days else 3
     warnings = check_subscription_warnings(subs, warn_days=warn_days)
 
@@ -2127,8 +1975,6 @@ def subscriptions_cmd(args):
                 print(f"  {label}  {format_subscription(w, warn=True)}")
         print()
 
-    # ── Sort and display all subscriptions ──
-    # Sort: active first, then by next_billing
     def sort_key(s):
         status_rank = 0 if s.get("status") == "cancelled" else 1
         billing = s.get("next_billing") or s.get("trial_end") or "9999-99-99"
@@ -2136,7 +1982,6 @@ def subscriptions_cmd(args):
 
     subs_sorted = sorted(subs, key=sort_key)
 
-    # Calculate summary stats
     active = [s for s in subs_sorted if s.get("status") != "cancelled"]
     total_monthly = 0
     total_yearly = 0
@@ -2155,7 +2000,6 @@ def subscriptions_cmd(args):
                 elif cycle == "quarterly":
                     total_monthly += val / 3
                 else:
-                    # Unknown cycle — assume monthly
                     total_monthly += val
             except (ValueError, TypeError):
                 pass
@@ -2172,7 +2016,6 @@ def subscriptions_cmd(args):
         print(f"     {len(subs_sorted) - len(active)} cancelled")
     print()
 
-    # ── Display table ──
     print(c("  ────────────────────────────────────────────────────────", Style.DIM))
     print(c("  Service           Plan        Amount   Cycle     Next Billing", Style.BOLD))
     print(c("  ────────────────────────────────────────────────────────", Style.DIM))
@@ -2195,7 +2038,6 @@ def subscriptions_cmd(args):
         elif sub.get("status") == "trial":
             status_mark = c(" ⚡", Style.YELLOW)
         else:
-            # Check if about to renew soon
             if sub.get("next_billing"):
                 try:
                     renew_date = datetime.datetime.strptime(sub["next_billing"], "%Y-%m-%d").date()
@@ -2209,8 +2051,6 @@ def subscriptions_cmd(args):
 
     print(c("  ────────────────────────────────────────────────────────", Style.DIM))
     print()
-
-    # ── Show usage ──
     print(c("  Tip:", Style.DIM), "subscriptions are auto-detected from inbox emails.")
     print(c("  Run:", Style.DIM), "verify-code daemon --subscriptions  (to track in background)")
     print()
@@ -2218,10 +2058,7 @@ def subscriptions_cmd(args):
 
 def dashboard_cmd(args):
     """Launch a local web dashboard showing subscriptions, code history, and events."""
-    import http.server
     import socketserver
-    import json as json_mod
-    import urllib.parse
 
     DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -2260,7 +2097,6 @@ def dashboard_cmd(args):
     position: relative;
   }
 
-  /* book-gutter shadow down the left edge */
   body::before {
     content: '';
     position: fixed;
@@ -2277,7 +2113,6 @@ def dashboard_cmd(args):
     padding: 44px 32px 80px 56px;
   }
 
-  /* ── Masthead ── */
   .masthead {
     display: flex;
     align-items: flex-end;
@@ -2335,7 +2170,6 @@ def dashboard_cmd(args):
   .refresh-stamp.spinning { animation: pulse 0.6s ease; }
   @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(0.94) rotate(-2deg); } 100% { transform: scale(1); } }
 
-  /* ── Balance line (summary) ── */
   .balance-line {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -2376,7 +2210,6 @@ def dashboard_cmd(args):
     font-style: italic;
   }
 
-  /* ── Index tabs ── */
   .tab-bar {
     display: flex;
     gap: 6px;
@@ -2416,7 +2249,6 @@ def dashboard_cmd(args):
   .tab-content { display: none; padding: 4px 0 0; }
   .tab-content.active { display: block; }
 
-  /* ── Ledger table ── */
   table { width: 100%; border-collapse: collapse; }
   thead th {
     text-align: left;
@@ -2451,7 +2283,6 @@ def dashboard_cmd(args):
     border-radius: 2px;
   }
 
-  /* ── Stamps (signature element) ── */
   .stamp {
     display: inline-block;
     font-family: 'IBM Plex Mono', monospace;
@@ -2477,7 +2308,6 @@ def dashboard_cmd(args):
   .flag-soon { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--brass); }
   .flag-far { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--ink-faint); }
 
-  /* ── Empty / loading / error states ── */
   .empty, .loading, .error {
     padding: 56px 20px;
     text-align: center;
@@ -2646,7 +2476,6 @@ async function loadAll(userTriggered) {
   document.getElementById('lastUpdated').innerHTML =
     'Last entry stamped <b>' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</b>';
 
-  // ── Balance line ──
   const activeSubs = subs.filter(s => s.status !== 'cancelled');
   const codes = logEntries.filter(e => e.type === 'CODE');
   const events = logEntries.filter(e => e.type === 'EVENT');
@@ -2678,7 +2507,6 @@ async function loadAll(userTriggered) {
     </div>
   `;
 
-  // ── Subscriptions ──
   const subsEl = document.getElementById('subscriptionsContent');
   if (subs.length === 0) {
     subsEl.innerHTML = '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon --subscriptions</code> to open a ledger for them.</div>';
@@ -2723,7 +2551,6 @@ async function loadAll(userTriggered) {
     subsEl.innerHTML = rows;
   }
 
-  // ── Codes ──
   const codesEl = document.getElementById('codesContent');
   if (codes.length === 0) {
     codesEl.innerHTML = '<div class="empty">No codes have been copied yet. Run <code>verify-code</code> to log the first entry.</div>';
@@ -2742,7 +2569,6 @@ async function loadAll(userTriggered) {
     codesEl.innerHTML = rows;
   }
 
-  // ── Events ──
   const eventsEl = document.getElementById('eventsContent');
   if (events.length === 0) {
     eventsEl.innerHTML = '<div class="empty">No events extracted yet. Run <code>verify-code daemon --calendar</code> to start logging them.</div>';
@@ -2767,7 +2593,6 @@ setInterval(() => loadAll(false), 30000);
 </body>
 </html>"""
 
-    # ── Build API handler ──
     class DashHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
@@ -2828,16 +2653,14 @@ setInterval(() => loadAll(false), 30000);
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
-                raw = json_mod.dumps(data, ensure_ascii=False, default=str)
+                raw = json.dumps(data, ensure_ascii=False, default=str)
                 self.wfile.write(raw.encode("utf-8"))
             except Exception:
                 self.wfile.write(b"[]")
 
         def log_message(self, format, *args):
-            # Quiet — don't clutter terminal
             pass
 
-    # ── Find a free port ──
     port = 8899
     for attempt in range(10):
         try:
@@ -2851,12 +2674,10 @@ setInterval(() => loadAll(false), 30000);
         print(c("  ✗  Could not find a free port.", Style.RED))
         return
 
-    # ── Start server in background thread ──
     server = socketserver.TCPServer(("127.0.0.1", port), DashHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    # ── Open browser ──
     url = f"http://127.0.0.1:{port}"
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
@@ -2892,7 +2713,6 @@ def daemon_run(args):
 
     have_calendar = bool(get_calendar_service())
 
-    # Resolve secure timeout: CLI override > creds config > off
     if args.secure_timeout > 0:
         secure_timeout = args.secure_timeout
     elif args.secure:
@@ -2911,8 +2731,7 @@ def daemon_run(args):
           f"  |  Known-senders: {'yes' if args.known_senders else 'no'}"
           f"  |  Calendar: {'yes' if have_calendar else 'no'}"
           f"  |  Subs: {'yes' if args.subscriptions else 'no'}"
-          f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}"
-          f"  |  Mode: {'IDLE' if args.idle else 'poll'}")
+          f"  |  Secure: {'yes' if secure_timeout > 0 else 'no'}{f' ({secure_timeout}s)' if secure_timeout > 0 else ''}")
     if have_calendar:
         print(f"     Calendar min confidence: {args.cal_threshold}%")
     print(f"     Last UID: {last_uid}", flush=True)
@@ -2922,35 +2741,51 @@ def daemon_run(args):
             con = connect(creds)
             use_idle = args.idle and supports_idle(con)
             if use_idle:
-                print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('IMAP IDLE', Style.CYAN)} mode active.", flush=True)
+                # FIX: IDLE mode bypassed imaplib state and broke subsequent SEARCH commands.
+                # We force polling mode for stability.
+                print(c(f"  [{datetime.datetime.now():%H:%M:%S}] IMAP IDLE disabled for stability. Polling mode active.", Style.DIM), flush=True)
             else:
                 print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('Polling', Style.DIM)} mode ({interval}s).", flush=True)
 
             while True:
-                if use_idle:
-                    res = wait_for_code_idle(con, window, since_uid=last_uid,
-                                             known_senders_only=args.known_senders,
-                                             idle_timeout=interval)
-                    if not res:
-                        # Safety: don't tight-loop if IDLE returns nothing
+                res = find_newest_code(con, window, since_uid=last_uid,
+                                       known_senders_only=args.known_senders)
+                if not res:
+                    if not use_idle:
+                        con.noop()
                         time.sleep(interval)
-                else:
-                    res = find_newest_code(con, window, since_uid=last_uid,
-                                           known_senders_only=args.known_senders)
-                    con.noop()
-                    time.sleep(interval)
+                    else:
+                        time.sleep(interval)
+                    continue
 
-                if res:
-                    now_ts = datetime.datetime.now().strftime("%H:%M:%S")
+                now_ts = datetime.datetime.now().strftime("%H:%M:%S")
 
-                    # ── Handle code ──
-                    if res["code"]:
-                        dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['code'])}"
-                        if dedup_key in seen_codes:
-                            print(f"  [{now_ts}] skipped duplicate {res['code']} from {res['sender']}", flush=True)
-                            last_uid = max(last_uid, res["uid"])
-                            continue
+                # FIX: Advance last_uid to the maximum UID seen during the search, 
+                # so non-code emails don't block the queue forever.
+                last_uid = max(last_uid, int(res.get("max_uid_seen", res["uid"])))
 
+                # If the found email has nothing actionable, skip processing
+                if not res.get("code") and not res.get("events") and not (args.subscriptions and res.get("body")):
+                    save_state({
+                        "last_uid": last_uid,
+                        "seen_codes": list(seen_codes),
+                        "seen_events": list(seen_events),
+                        "seen_subscriptions": list(seen_subscriptions),
+                        "last_time": datetime.datetime.now().isoformat(),
+                    })
+                    if not use_idle:
+                        con.noop()
+                        time.sleep(interval)
+                    else:
+                        time.sleep(interval)
+                    continue
+
+                # ── Handle code ──
+                if res["code"]:
+                    dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['code'])}"
+                    if dedup_key in seen_codes:
+                        print(f"  [{now_ts}] skipped duplicate {res['code']} from {res['sender']}", flush=True)
+                    else:
                         try:
                             if secure_timeout > 0:
                                 secure_copy_clipboard(res["code"], timeout=secure_timeout)
@@ -2968,63 +2803,61 @@ def daemon_run(args):
                             print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
                             log_event(res["sender"], res["subject"], code=res["code"])
 
-                        last_uid = res["uid"]
                         seen_codes.add(dedup_key)
                         if len(seen_codes) > 50:
                             seen_codes = set(list(seen_codes)[-50:])
 
-                    # ── Handle events ──
-                    if res["events"] and have_calendar:
-                        for ev in res["events"]:
-                            ev_key = f"{res['uid']}:{ev['start']}"
-                            if ev_key in seen_events:
-                                continue
-                            if ev["confidence"] >= args.cal_threshold:
-                                # Check if it's a real event (not just any date)
-                                link = add_event_to_calendar(ev)
-                                if link:
-                                    seen_events.add(ev_key)
-                                    log_event(res["sender"], res["subject"], event=ev["title"])
-                                    msg = f"📅  {ev['title']} @ {ev['start'][:16]}"
-                                    notify("Event added to calendar", msg)
-                                    print(c(f"  [{now_ts}] {msg}", Style.CYAN), flush=True)
-                                    # Keep seen_events bounded
-                                    if len(seen_events) > 50:
-                                        seen_events = set(list(seen_events)[-50:])
+                # ── Handle events ──
+                if res["events"] and have_calendar:
+                    for ev in res["events"]:
+                        ev_key = f"{res['uid']}:{ev['start']}"
+                        if ev_key in seen_events:
+                            continue
+                        if ev["confidence"] >= args.cal_threshold:
+                            link = add_event_to_calendar(ev)
+                            if link:
+                                seen_events.add(ev_key)
+                                log_event(res["sender"], res["subject"], event=ev["title"])
+                                msg = f"📅  {ev['title']} @ {ev['start'][:16]}"
+                                notify("Event added to calendar", msg)
+                                print(c(f"  [{now_ts}] {msg}", Style.CYAN), flush=True)
+                                if len(seen_events) > 50:
+                                    seen_events = set(list(seen_events)[-50:])
 
-                    # ── Handle subscriptions ──
-                    if args.subscriptions:
-                        sub = extract_subscription(res["body"], res["subject"], res["sender"])
-                        if sub:
-                            dedup_key = _subscription_key(sub)
-                            if dedup_key not in seen_subscriptions:
-                                seen_subscriptions.add(dedup_key)
-                                save_subscription(sub)
-                                log_event(res["sender"], res["subject"], event=f"sub:{sub['service']}")
-                                msg = f"💳  {sub['service']}"
-                                if sub["amount"]:
-                                    msg += f" {sub['amount']}"
-                                if sub["billing_cycle"]:
-                                    msg += f"/{sub['billing_cycle']}"
-                                if sub["next_billing"]:
-                                    msg += f" → renews {sub['next_billing']}"
-                                elif sub["trial_end"]:
-                                    msg += f" → trial ends {sub['trial_end']}"
-                                notify("Subscription detected", msg)
-                                print(c(f"  [{now_ts}] {msg}", Style.MAGENTA), flush=True)
-                                # Keep bounded
-                                if len(seen_subscriptions) > 50:
-                                    seen_subscriptions = set(list(seen_subscriptions)[-50:])
+                # ── Handle subscriptions ──
+                if args.subscriptions and res.get("body"):
+                    sub = extract_subscription(res["body"], res["subject"], res["sender"])
+                    if sub:
+                        dedup_key = _subscription_key(sub)
+                        if dedup_key not in seen_subscriptions:
+                            seen_subscriptions.add(dedup_key)
+                            save_subscription(sub)
+                            log_event(res["sender"], res["subject"], event=f"sub:{sub['service']}")
+                            msg = f"💳  {sub['service']}"
+                            if sub["amount"]:
+                                msg += f" {sub['amount']}"
+                            if sub["billing_cycle"]:
+                                msg += f"/{sub['billing_cycle']}"
+                            if sub["next_billing"]:
+                                msg += f" → renews {sub['next_billing']}"
+                            elif sub["trial_end"]:
+                                msg += f" → trial ends {sub['trial_end']}"
+                            notify("Subscription detected", msg)
+                            print(c(f"  [{now_ts}] {msg}", Style.MAGENTA), flush=True)
+                            if len(seen_subscriptions) > 50:
+                                seen_subscriptions = set(list(seen_subscriptions)[-50:])
 
-                    # Update state (even if only UID advanced)
-                    last_uid = max(last_uid, res["uid"])
-                    save_state({
-                        "last_uid": last_uid,
-                        "seen_codes": list(seen_codes),
-                        "seen_events": list(seen_events),
-                        "seen_subscriptions": list(seen_subscriptions),
-                        "last_time": datetime.datetime.now().isoformat(),
-                    })
+                save_state({
+                    "last_uid": last_uid,
+                    "seen_codes": list(seen_codes),
+                    "seen_events": list(seen_events),
+                    "seen_subscriptions": list(seen_subscriptions),
+                    "last_time": datetime.datetime.now().isoformat(),
+                })
+
+                # Don't sleep if we just processed an email, immediately check for more
+                if not use_idle:
+                    con.noop()
 
         except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError) as e:
             print(f"  [{datetime.datetime.now():%H:%M:%S}] connection error: {e}; retrying…",
@@ -3081,7 +2914,6 @@ def scan_mode(args):
         print("  Tip: Try --minutes 60 to scan a wider window.")
         print()
 
-    # ── Handle subscriptions ──
     if args.subscriptions and res["body"]:
         sub = extract_subscription(res["body"], res["subject"], res["sender"])
         if sub:
@@ -3089,7 +2921,6 @@ def scan_mode(args):
             print()
             print(f"     {format_subscription(sub)}")
             print()
-            # Save it
             save_subscription(sub)
             print(c("  ✅  Subscription saved to tracker.", Style.GREEN))
             print(c("  Run: verify-code subscriptions  (to view all tracked)", Style.DIM))
@@ -3109,7 +2940,6 @@ def install_service(args):
     if IS_WINDOWS:
         local_script += ".py"
 
-    # ── Download the latest from GitHub (cache-busting) ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
@@ -3121,7 +2951,6 @@ def install_service(args):
     if version_str is None:
         return
 
-    # ── PATH check ──
     if local_bin not in os.environ.get("PATH", ""):
         if IS_WINDOWS:
             print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
@@ -3133,11 +2962,9 @@ def install_service(args):
             print(f"     source ~/.bashrc")
         print()
 
-    # ── Install auto-start service (systemd on Linux, task scheduler on Windows) ──
     if not IS_WINDOWS and SERVICE_FILE:
         os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
 
-        # Check if secure mode was configured
         secure_args = ""
         try:
             if os.path.exists(CRED_FILE):
@@ -3149,6 +2976,7 @@ def install_service(args):
         except Exception:
             pass
 
+        # FIX: Use %U for systemd unit files so it correctly expands to the user's UID
         service_content = f"""\
 [Unit]
 Description=verify-code v{version_str} — auto-copy codes, find events
@@ -3162,7 +2990,7 @@ Restart=on-failure
 RestartSec=10
 Environment=DISPLAY=:0
 Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/$UID
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 [Install]
 WantedBy=default.target
@@ -3177,7 +3005,6 @@ WantedBy=default.target
         print(c("  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
         print(c("  ⚡  On Windows, add to Task Scheduler or startup folder for auto-start.", Style.YELLOW))
 
-    # ── Ask: run setup? ──
     ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
     if ans != "n":
         print()
@@ -3186,7 +3013,6 @@ WantedBy=default.target
         setup()
         print()
 
-    # ── Ask: enable daemon? ──
     ans = input(c("  🤖  Enable the 24/7 background daemon (auto-copy codes)? (Y/n): ", Style.BOLD)).strip().lower()
     if ans != "n":
         print()
@@ -3208,7 +3034,6 @@ WantedBy=default.target
         else:
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
-    # ── Summary ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
@@ -3254,7 +3079,6 @@ def uninstall():
     removed = []
     errors = []
 
-    # 1. Systemd service (Linux only)
     if not IS_WINDOWS and SERVICE_FILE and os.path.exists(SERVICE_FILE):
         try:
             subprocess.run(["systemctl", "--user", "stop", "verify-code"],
@@ -3266,7 +3090,6 @@ def uninstall():
         except Exception as e:
             errors.append(f"systemd: {e}")
 
-    # 2. Script from path
     if IS_WINDOWS:
         local_script = os.path.join(CONFIG_DIR, "verify-code.py")
     else:
@@ -3278,7 +3101,6 @@ def uninstall():
         except Exception as e:
             errors.append(f"script: {e}")
 
-    # 3. Config directory
     if os.path.exists(CONFIG_DIR):
         import shutil
         try:
@@ -3287,7 +3109,6 @@ def uninstall():
         except Exception as e:
             errors.append(f"config: {e}")
 
-    # 4. Data directory
     if os.path.exists(STATE_DIR):
         import shutil
         try:
@@ -3320,8 +3141,7 @@ def uninstall():
 
 
 def download_latest():
-    """Download the latest verify-code from GitHub to the install path.
-    Returns the version string on success, None on failure."""
+    """Download the latest verify-code from GitHub to the install path."""
     if IS_WINDOWS:
         local_bin = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code")
         local_script = os.path.join(local_bin, "verify-code.py")
@@ -3330,12 +3150,10 @@ def download_latest():
         local_script = os.path.join(local_bin, "verify-code")
     os.makedirs(local_bin, exist_ok=True)
 
-    # ── Check curl / PowerShell ──
     if not _which("curl") and not IS_WINDOWS:
         print(c("  ✗  curl is required. Install it: sudo apt install curl", Style.RED))
         return None
 
-    # ── Download with progress bar ──
     cache_buster = f"?v={int(time.time())}"
     url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     print(c("  🌐  Downloading from GitHub…", Style.BOLD))
@@ -3359,7 +3177,6 @@ def download_latest():
     _chmod_755(local_script)
     print()
 
-    # ── Read version ──
     version_str = "?"
     try:
         for line in open(local_script):
@@ -3379,7 +3196,6 @@ def self_install(script_path=None):
     """Download the latest verify-code from GitHub and run the setup wizard."""
     local_bin = os.path.expanduser("~/.local/bin")
 
-    # ── Banner ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
@@ -3397,7 +3213,6 @@ def self_install(script_path=None):
     else:
         local_script = os.path.join(local_bin, "verify-code")
 
-    # ── PATH check ──
     if local_bin not in os.environ.get("PATH", ""):
         if IS_WINDOWS:
             print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
@@ -3409,7 +3224,6 @@ def self_install(script_path=None):
             print(f"     source ~/.bashrc")
         print()
 
-    # ── Ask: run setup? ──
     ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
     if ans != "n":
         print()
@@ -3418,7 +3232,6 @@ def self_install(script_path=None):
         setup()
         print()
 
-    # ── Ask: enable daemon? ──
     ans = input(c("  🤖  Enable the 24/7 background daemon (auto-copy codes)? (Y/n): ", Style.BOLD)).strip().lower()
     if ans != "n":
         print()
@@ -3443,7 +3256,6 @@ def self_install(script_path=None):
         else:
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
-    # ── Summary ──
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
@@ -3466,7 +3278,6 @@ def update_self():
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
-    # Check for curl / PowerShell
     if not _which("curl") and not IS_WINDOWS:
         print(c("  ✗  curl is required for updates.", Style.RED))
         print("  Install it: sudo apt install curl")
@@ -3474,7 +3285,6 @@ def update_self():
 
     current_version = __version__
 
-    # Download to a temp file first to check the version
     cache_buster = f"?v={int(time.time())}"
     url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     if IS_WINDOWS:
@@ -3509,7 +3319,6 @@ def update_self():
                     pass
             return
 
-        # Read the new version
         remote_version = "?"
         try:
             for line in open(tmp_script):
@@ -3525,7 +3334,6 @@ def update_self():
             print()
             return
 
-        # Install the new version
         os.replace(tmp_script, local_script)
         _chmod_755(local_script)
         print(c(f"  ✅  Updated from {current_version} → {remote_version}!", Style.GREEN, Style.BOLD))
@@ -3623,7 +3431,6 @@ One-liner install (Windows PowerShell):
     elif args.cmd == "daemon":
         daemon_run(args)
     elif args.cmd == "install":
-        # If running from piped stdin (curl | python3 - install), do self-install
         if sys.argv[0] in ("-", "/dev/stdin"):
             self_install()
         else:
