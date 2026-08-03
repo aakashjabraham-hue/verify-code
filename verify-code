@@ -68,7 +68,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.3.7"
+__version__ = "2.3.8"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -2712,6 +2712,9 @@ setInterval(() => loadAll(false), 30000);
 
 def daemon_run(args):
     """Background daemon mode: watch inbox, auto-copy codes, extract events."""
+    # Force subscription tracking ON automatically for the daemon
+    args.subscriptions = True
+    
     creds = load_creds()
     window = datetime.timedelta(minutes=args.minutes)
     state = load_state()
