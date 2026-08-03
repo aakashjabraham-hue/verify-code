@@ -490,7 +490,17 @@ def copy_clipboard(text):
                 else:
                     continue
             if _which(cmd[0]):
-                res = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=5)
+                # FIX: Use DEVNULL instead of capture_output=True.
+                # wl-copy and xclip fork a background process to keep the clipboard alive.
+                # If we capture output, Python waits for the pipe to close, which blocks 
+                # forever and causes a TimeoutExpired exception.
+                res = subprocess.run(
+                    cmd, 
+                    input=text.encode(), 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL, 
+                    timeout=5
+                )
                 if res.returncode == 0:
                     return backend
                 continue
@@ -508,11 +518,11 @@ def erase_clipboard():
                     return
                 continue
             if _which(cmd[0]):
-                subprocess.run(cmd, input=b" " * 20, capture_output=True, timeout=5)
+                # FIX: Redirect to DEVNULL so Python doesn't block waiting for the background process
+                subprocess.run(cmd, input=b" " * 20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                 return
         except (subprocess.TimeoutExpired, OSError):
             continue
-
 
 def secure_copy_clipboard(text, timeout=30):
     """Copy code to clipboard and schedule auto-erase after `timeout` seconds."""
