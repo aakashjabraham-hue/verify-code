@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-verify-code v2.3.5 — grab codes, find events, track subscriptions, add to calendar.
+verify-code v2.4.0 — grab codes, magic links, find events, track subscriptions, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
-  verify-code                  One-shot: copy newest verification code from last 10 min.
-  verify-code daemon           Background: watch inbox, auto-copy codes, extract events.
+  verify-code                  One-shot: copy newest verification code/link from last 10 min.
+  verify-code daemon           Background: watch inbox, auto-copy codes/links, extract events.
   verify-code install          Install auto-start service for login.
   verify-code scan             Scan inbox for events with dates/times (no code copy).
   verify-code subscriptions    View all tracked subscriptions with warnings and spending totals.
@@ -13,10 +13,11 @@ Modes:
   verify-code auth             (Re-)authenticate Google Calendar.
   verify-code version          Show the installed version.
   verify-code --version        Show the installed version (alternative).
-  verify-code history          Show the last 10 copied verification codes.
+  verify-code history          Show the last 10 copied verification codes/links.
 
 Features:
   - Gmail, Outlook, and Hotmail IMAP support
+  - Magic Link extraction (copies verification URLs safely)
   - Subscription tracking: detect plans, renewals, trials from 80+ services
   - Free trial warnings and renewal reminders
   - Secure Mode: auto-erase clipboard after N seconds
@@ -24,7 +25,7 @@ Features:
   - IMAP IDLE for instant delivery (falls back to polling).
   - Known-sender whitelist (80+ senders) prevents false positives.
   - Confidence scoring for code extraction.
-  - Dedup tracking — codes never re-copied, events never re-added.
+  - Dedup tracking — codes/links never re-copied, events never re-added.
   - Atomic state writes with CRC validation.
   - Credentials in ~/.config/verify-code/ (chmod 600).
   - OAuth token stored alongside credentials.
@@ -68,7 +69,7 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.3.8"
+__version__ = "2.4.0"
 
 # ── Platform detection ────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -146,7 +147,7 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║         🔐  verify-code  v2.3  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║         🔐  verify-code  v2.4  🔐        ║", Style.CYAN, Style.BOLD))
     print(c("  ║    Auto-copy codes · Find events · 💳 Sub  ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
@@ -473,7 +474,8 @@ def notify(title, body):
 
 
 def copy_clipboard(text):
-    text = text.strip().replace(" ", "").replace("-", "")
+    # FIX: Only strip whitespace. Do NOT strip hyphens, as URLs contain them.
+    text = text.strip()
     for cmd, backend in [
         (["powershell", "-Command", "$input | Set-Clipboard"], "windows"),
         (["wl-copy"], "wayland"),
@@ -524,8 +526,9 @@ def erase_clipboard():
         except (subprocess.TimeoutExpired, OSError):
             continue
 
+
 def secure_copy_clipboard(text, timeout=30):
-    """Copy code to clipboard and schedule auto-erase after `timeout` seconds."""
+    """Copy code/link to clipboard and schedule auto-erase after `timeout` seconds."""
     global _CLIPBOARD_GEN
     backend = copy_clipboard(text)
     if timeout > 0:
@@ -534,7 +537,7 @@ def secure_copy_clipboard(text, timeout=30):
         
         def _erase():
             time.sleep(timeout)
-            # Only erase if no newer code has been copied!
+            # Only erase if no newer code/link has been copied!
             if my_gen == _CLIPBOARD_GEN:
                 erase_clipboard()
                 
@@ -543,8 +546,8 @@ def secure_copy_clipboard(text, timeout=30):
     return backend
 
 
-def get_plain(msg):
-    """Extract plain text from email, with proper charset handling."""
+def get_email_bodies(msg):
+    """Extract plain text and raw HTML from email, with proper charset handling."""
     if msg.is_multipart():
         plain = html = None
         for part in msg.walk():
@@ -572,21 +575,25 @@ def get_plain(msg):
                 except Exception:
                     pass
         if plain:
-            return plain
+            return plain, html
         if html:
-            return html_to_text(html)
-        return ""
+            return html_to_text(html), html
+        return "", None
     try:
         body = msg.get_payload(decode=True)
         if body is None:
-            return ""
+            return "", None
         charset = msg.get_content_charset() or "utf-8"
         try:
-            return body.decode(charset, errors="replace")
+            decoded = body.decode(charset, errors="replace")
         except LookupError:
-            return body.decode("utf-8", errors="replace")
+            decoded = body.decode("utf-8", errors="replace")
+            
+        if msg.get_content_type() == "text/html":
+            return html_to_text(decoded), decoded
+        return decoded, None
     except Exception:
-        return str(msg)
+        return str(msg), None
 
 
 def html_to_text(html):
@@ -607,6 +614,44 @@ def html_to_text(html):
     text = re.sub(r"\n\s*\n", "\n", text)
     text = re.sub(r" +", " ", text)
     return text.strip()
+
+# ── Magic Link Extraction ─────────────────────────────────────────────
+RE_A_TAG = re.compile(r'<a\s[^>]*href=["\'](?P<url>[^"\']+)["\'][^>]*>(?P<text>.*?)</a>', re.I | re.S)
+RE_LINK_BLACKLIST = re.compile(
+    r"(?:unsubscribe|preferences|privacy|terms|facebook|twitter|linkedin|instagram|"
+    r"youtube|mailto|tel:|#|apple\.com|google\.com|play\.google|apps\.apple|"
+    r"manage\snotifications|view\sin\sbrowser|download|app\sstore|google\splay|"
+    r"contact\sus|support|help|faq|blog|newsletter|copyright|©)",
+    re.I
+)
+
+def extract_magic_link(html, subject="", sender=""):
+    """Find a verification/magic link in HTML email."""
+    if not html:
+        return None
+        
+    known_sender = is_known_sender(sender)
+    
+    for m in RE_A_TAG.finditer(html):
+        url = m.group("url").strip()
+        text = re.sub(r'<[^>]+>', '', m.group("text")).strip()
+        
+        # Must be a valid web URL
+        if not url.startswith("http"):
+            continue
+            
+        # Check if the link text or URL itself has verification context
+        has_context = bool(CONTEXT_WORDS.search(text) or CONTEXT_WORDS.search(url))
+        is_blacklisted = bool(RE_LINK_BLACKLIST.search(text) or RE_LINK_BLACKLIST.search(url))
+        
+        if has_context and not is_blacklisted:
+            # If not from a known sender, require very strong context words to prevent phishing
+            if not known_sender:
+                if not re.search(r"(?:verify|confirm|magic|authenticat|sign[\s-]?in|log[\s-]?in)", text, re.I):
+                    continue
+            return url
+            
+    return None
 
 
 def _sender_domain(sender: str) -> str:
@@ -792,8 +837,6 @@ def extract_datetime(text, subject="", sender=""):
             except (ValueError, TypeError):
                 pass
 
-    # Removed Method 4 (Fuzzy dateutil parsing) to prevent massive CPU usage and false positives.
-
     seen = set()
     unique_dates = []
     for dt, conf in found_dates:
@@ -958,7 +1001,6 @@ RE_PLAN_NAME = re.compile(
 )
 
 # Regex to find dates near subscription keywords
-# (Fixed regex typo: removed the erroneous \\. which matched literal backslash + any char)
 RE_SUB_DATE = re.compile(
     r"(?:on|by|before|after|for|date:)?\s*"
     r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
@@ -1324,7 +1366,6 @@ def add_event_to_calendar(event):
         return False
 
     try:
-        # FIX: Use local system timezone instead of hardcoded America/Chicago
         local_tz = datetime.datetime.now().astimezone().tzinfo
         
         start_iso = event["start"]
@@ -1371,8 +1412,6 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
     now = datetime.datetime.now(datetime.timezone.utc)
     uids = []
     
-    # FIX: Removed the X-GM-RAW newer_than:10m search because 'm' means months in Gmail search syntax.
-    # We rely entirely on the standard IMAP SINCE date search, which is safe and accurate.
     since = (now - window).strftime("%d-%b-%Y")
     try:
         typ, data = con.uid('SEARCH', None, "SINCE", since)
@@ -1384,7 +1423,6 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
     if not uids:
         return None
 
-    # FIX: Filter out seen UIDs instead of skipping inside the loop
     new_uids = [u for u in uids if int(u) > since_uid]
     if not new_uids:
         return None
@@ -1392,7 +1430,6 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
     best_result = None
     newest_uid_seen = since_uid
 
-    # FIX: Walk ALL new UIDs (newest to oldest) to find the best code, instead of returning on the first email.
     for uid in reversed(new_uids):
         uid_int = int(uid)
         newest_uid_seen = max(newest_uid_seen, uid_int)
@@ -1420,9 +1457,10 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             if typ != "OK":
                 continue
             msg = email.message_from_bytes(data[0][1])
-            body = get_plain(msg)
+            body, raw_html = get_email_bodies(msg)
 
             result = extract_code(body, subject, sender)
+            link = extract_magic_link(raw_html, subject, sender) if raw_html else None
             events = extract_datetime(body, subject, sender) if DATEUTIL_AVAILABLE else []
 
             candidate = {
@@ -1435,24 +1473,22 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
                 "uid": uid,
                 "events": events,
                 "body": body,
+                "link": link,
                 "max_uid_seen": newest_uid_seen
             }
 
-            # Return immediately if we find a code (since we are newest -> oldest)
             if result and result.get("code"):
                 return candidate
                 
-            # Fallback if no code is found, keep track of the newest email to process events/subs
             if best_result is None:
                 best_result = candidate
         except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, IndexError):
             continue
 
     if best_result is None:
-        # Advance last_uid even if we couldn't fetch anything, to prevent infinite loops
         return {"uid": str(newest_uid_seen), "max_uid_seen": newest_uid_seen, "code": None,
                 "confidence": 0, "method": None, "sender": "", "subject": "", "age": None,
-                "events": [], "body": ""}
+                "events": [], "body": "", "link": None}
     return best_result
 
 
@@ -1472,7 +1508,7 @@ def supports_idle(con):
 def setup():
     """Interactive, fun setup wizard."""
     print_banner()
-    print(c("  Welcome to verify-code v2.3! Let's get you set up. 🚀", Style.BOLD))
+    print(c("  Welcome to verify-code v2.4! Let's get you set up. 🚀", Style.BOLD))
     print()
     time.sleep(0.5)
 
@@ -1587,7 +1623,7 @@ def setup():
             print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
             print()
             print(c("  What now?", Style.BOLD))
-            print("  •  verify-code              — one-shot: copy latest code")
+            print("  •  verify-code              — one-shot: copy latest code/link")
             print("  •  verify-code daemon       — background: watch & auto-copy")
             print("  •  verify-code scan         — scan inbox for events with dates/times")
             print("  •  verify-code install      — auto-start on login + install to PATH")
@@ -1758,7 +1794,7 @@ def setup():
     print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print(c("  What now?", Style.BOLD))
-    print("  •  verify-code              — one-shot: copy latest code")
+    print("  •  verify-code              — one-shot: copy latest code/link")
     print("  •  verify-code daemon       — background: watch & auto-copy")
     print("  •  verify-code scan         — scan inbox for events with dates/times")
     print("  •  verify-code install      — auto-start on login + install to PATH")
@@ -1824,6 +1860,8 @@ def run(args):
             print(f"  Code:       {res['code']}  (confidence: {res['confidence']}%, method: {res['method']})")
         else:
             print("  Code:       (none found)")
+        if res.get("link"):
+            print(f"  Link:       {res['link']}")
         if res["events"]:
             for ev in res["events"]:
                 print(f"  Event:      {ev['title']} @ {ev['start']}  (confidence: {ev['confidence']}%)")
@@ -1854,8 +1892,32 @@ def run(args):
         print(c(f"  Code:    {res['code']}", Style.CYAN, Style.BOLD))
         print(f"  Confidence: {res['confidence']}%  ({res['method']})")
         print()
+    elif res.get("link"):
+        secure_timeout = 0
+        try:
+            creds_data = load_creds()
+            if creds_data.get("secure"):
+                secure_timeout = creds_data.get("secure_timeout", 30)
+        except Exception:
+            pass
+
+        if secure_timeout > 0:
+            backend = secure_copy_clipboard(res["link"], timeout=secure_timeout)
+            notify("verify-code", f"Copied magic link (auto-erase in {secure_timeout}s)")
+            print(c(f"  🔗  Copied magic link to clipboard ({backend}).", Style.GREEN, Style.BOLD))
+            print(c(f"  🔒  Auto-erase in {secure_timeout}s", Style.YELLOW))
+        else:
+            backend = copy_clipboard(res["link"])
+            notify("verify-code", f"Copied magic link from {res['sender']}")
+            print(c(f"  🔗  Copied magic link to clipboard ({backend}).", Style.GREEN, Style.BOLD))
+            
+        log_event(res["sender"], res["subject"], code=f"LINK:{res['link']}")
+        print(f"  From:    {res['sender']}")
+        print(f"  Subject: {res['subject']}")
+        print(c(f"  Link:    {res['link']}", Style.CYAN, Style.BOLD))
+        print()
     else:
-        print(c("  📭  Email found, but no verification code could be extracted.", Style.YELLOW))
+        print(c("  📭  Email found, but no verification code or link could be extracted.", Style.YELLOW))
         print(f"  From:    {res['sender']}")
         print(f"  Subject: {res['subject']}")
         if res.get("events"):
@@ -1937,7 +1999,11 @@ def history_cmd():
         m = re.match(r"\[(.*?)\] CODE sender=(.*?) subject=(.*?) code=(.*)", entry)
         if m:
             ts, sender, subject, code = m.groups()
-            print(f"  {c(ts, Style.DIM)}  {c(code, Style.GREEN, Style.BOLD)}  "
+            if code.startswith("LINK:"):
+                display = c("🔗 " + (code[5:] if len(code) <= 45 else code[5:42] + "..."), Style.GREEN, Style.BOLD)
+            else:
+                display = c(code, Style.GREEN, Style.BOLD)
+            print(f"  {c(ts, Style.DIM)}  {display}  "
                   f"from {c(sender[:30], Style.DIM)}")
         else:
             print(f"  {entry}")
@@ -2062,7 +2128,7 @@ def subscriptions_cmd(args):
     print(c("  ────────────────────────────────────────────────────────", Style.DIM))
     print()
     print(c("  Tip:", Style.DIM), "subscriptions are auto-detected from inbox emails.")
-    print(c("  Run:", Style.DIM), "verify-code daemon --subscriptions  (to track in background)")
+    print(c("  Run:", Style.DIM), "verify-code daemon  (to track in background automatically)")
     print()
 
 
@@ -2519,7 +2585,7 @@ async function loadAll(userTriggered) {
 
   const subsEl = document.getElementById('subscriptionsContent');
   if (subs.length === 0) {
-    subsEl.innerHTML = '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon --subscriptions</code> to open a ledger for them.</div>';
+    subsEl.innerHTML = '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon</code> to open a ledger for them.</div>';
   } else {
     const sorted = [...subs].sort((a, b) => {
       const aC = a.status === 'cancelled' ? 1 : 0, bC = b.status === 'cancelled' ? 1 : 0;
@@ -2568,9 +2634,19 @@ async function loadAll(userTriggered) {
     let rows = '<table><thead><tr><th>Time</th><th>Code</th><th>From</th><th>Subject</th></tr></thead><tbody>';
     [...codes].reverse().slice(0, 50).forEach(e => {
       const sender = e.sender || '?', subject = e.subject || '?';
+      let codeVal = e.code || '?';
+      let isLink = false;
+      if (codeVal.startsWith('LINK:')) {
+          isLink = true;
+          codeVal = codeVal.substring(5);
+          if (codeVal.length > 40) codeVal = codeVal.substring(0, 37) + '...';
+      }
+      const codeHtml = isLink 
+          ? `<span class="code-cell">🔗 ${esc(codeVal)}</span>` 
+          : `<span class="code-cell">${esc(codeVal)}</span>`;
       rows += `<tr>
         <td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
-        <td><span class="code-cell">${esc(e.code || '?')}</span></td>
+        <td>${codeHtml}</td>
         <td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td>
         <td class="dim">${esc(subject.length > 50 ? subject.slice(0, 50) + '…' : subject)}</td>
       </tr>`;
@@ -2581,7 +2657,7 @@ async function loadAll(userTriggered) {
 
   const eventsEl = document.getElementById('eventsContent');
   if (events.length === 0) {
-    eventsEl.innerHTML = '<div class="empty">No events extracted yet. Run <code>verify-code daemon --calendar</code> to start logging them.</div>';
+    eventsEl.innerHTML = '<div class="empty">No events extracted yet. Run <code>verify-code daemon</code> to start logging them.</div>';
   } else {
     let rows = '<table><thead><tr><th>Time</th><th>Event</th><th>From</th></tr></thead><tbody>';
     [...events].reverse().slice(0, 50).forEach(e => {
@@ -2754,8 +2830,6 @@ def daemon_run(args):
             con = connect(creds)
             use_idle = args.idle and supports_idle(con)
             if use_idle:
-                # FIX: IDLE mode bypassed imaplib state and broke subsequent SEARCH commands.
-                # We force polling mode for stability.
                 print(c(f"  [{datetime.datetime.now():%H:%M:%S}] IMAP IDLE disabled for stability. Polling mode active.", Style.DIM), flush=True)
             else:
                 print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('Polling', Style.DIM)} mode ({interval}s).", flush=True)
@@ -2773,12 +2847,9 @@ def daemon_run(args):
 
                 now_ts = datetime.datetime.now().strftime("%H:%M:%S")
 
-                # FIX: Advance last_uid to the maximum UID seen during the search, 
-                # so non-code emails don't block the queue forever.
                 last_uid = max(last_uid, int(res.get("max_uid_seen", res["uid"])))
 
-                # If the found email has nothing actionable, skip processing
-                if not res.get("code") and not res.get("events") and not (args.subscriptions and res.get("body")):
+                if not res.get("code") and not res.get("link") and not res.get("events") and not (args.subscriptions and res.get("body")):
                     save_state({
                         "last_uid": last_uid,
                         "seen_codes": list(seen_codes),
@@ -2815,6 +2886,25 @@ def daemon_run(args):
                         except RuntimeError as e:
                             print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
                             log_event(res["sender"], res["subject"], code=res["code"])
+
+                        seen_codes.add(dedup_key)
+                        if len(seen_codes) > 50:
+                            seen_codes = set(list(seen_codes)[-50:])
+                            
+                # ── Handle magic link (only if no code was found) ──
+                elif res.get("link"):
+                    dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['link'])}"
+                    if dedup_key in seen_codes:
+                        print(f"  [{now_ts}] skipped duplicate link from {res['sender']}", flush=True)
+                    else:
+                        try:
+                            copy_clipboard(res["link"])
+                            notify("Magic link copied ✅", f"Verification link from {res['sender']}")
+                            log_event(res["sender"], res["subject"], code=f"LINK:{res['link']}")
+                            print(c(f"  [{now_ts}] 🔗 Copied magic link from {res['sender']}", Style.GREEN), flush=True)
+                        except RuntimeError as e:
+                            print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
+                            log_event(res["sender"], res["subject"], code=f"LINK:{res['link']}")
 
                         seen_codes.add(dedup_key)
                         if len(seen_codes) > 50:
@@ -2868,7 +2958,6 @@ def daemon_run(args):
                     "last_time": datetime.datetime.now().isoformat(),
                 })
 
-                # Don't sleep if we just processed an email, immediately check for more
                 if not use_idle:
                     con.noop()
 
@@ -2908,6 +2997,12 @@ def scan_mode(args):
         print(f"     From: {res['sender']}")
         print(f"     Subject: {res['subject']}")
         print(f"     Confidence: {res['confidence']}% ({res['method']})")
+        print()
+    elif res.get("link"):
+        print(c(f"  🔗  Magic link found!", Style.GREEN, Style.BOLD))
+        print(f"     From: {res['sender']}")
+        print(f"     Subject: {res['subject']}")
+        print(c(f"     Link: {res['link']}", Style.CYAN))
         print()
 
     if res["events"]:
@@ -2989,7 +3084,6 @@ def install_service(args):
         except Exception:
             pass
 
-        # FIX: Use %U for systemd unit files so it correctly expands to the user's UID
         service_content = f"""\
 [Unit]
 Description=verify-code v{version_str} — auto-copy codes, find events
@@ -2998,7 +3092,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={local_script} daemon --calendar{secure_args}
+ExecStart={local_script} daemon{secure_args}
 Restart=on-failure
 RestartSec=10
 Environment=DISPLAY=:0
@@ -3053,7 +3147,7 @@ WantedBy=default.target
     print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print("  Quick commands:")
-    print("    verify-code                  # One-shot: copy latest code")
+    print("    verify-code                  # One-shot: copy latest code/link")
     print("    verify-code daemon           # Run background daemon")
     print("    verify-code update           # Update to latest version")
     print("    verify-code version          # Show installed version")
@@ -3275,7 +3369,7 @@ def self_install(script_path=None):
     print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print("  Quick commands:")
-    print("    verify-code              — copy latest code")
+    print("    verify-code              — copy latest code/link")
     print("    verify-code scan         — find events in inbox")
     print("    verify-code daemon       — run 24/7 watcher")
     print("    verify-code update       — get latest from GitHub")
@@ -3383,11 +3477,10 @@ def main():
         epilog="""\
 Examples:
   verify-code setup              # Interactive wizard (fun! 🎉)
-  verify-code                    # One-shot: copy latest code
+  verify-code                    # One-shot: copy latest code/link
   verify-code scan               # Scan inbox for events
   verify-code scan --subscriptions  # Scan for subscriptions
   verify-code daemon             # Background: watch, copy, calendar
-  verify-code daemon --subscriptions  # Daemon + subscription tracking
   verify-code subscriptions      # View tracked subscriptions
   verify-code dashboard          # Launch web dashboard in browser
   verify-code install            # Install to ~/.local/bin + systemd service
@@ -3396,7 +3489,7 @@ Examples:
   verify-code auth               # (Re-)auth Google Calendar
   verify-code version            # Show version
   verify-code --version          # Show version (alternative)
-  verify-code history            # Show last 10 copied codes
+  verify-code history            # Show last 10 copied codes/links
   verify-code daemon --secure --secure-timeout 15  # Daemon with auto-erase
 
 One-liner install (Linux/macOS):
