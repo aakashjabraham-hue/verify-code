@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify-code v2.4.0 — grab codes, magic links, find events, track subscriptions, add to calendar.
+verify-code v2.4.2 — grab codes, magic links, find events, track subscriptions, add to calendar.
 
 Modes:
   verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
@@ -31,6 +31,8 @@ Features:
   - OAuth token stored alongside credentials.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -49,11 +51,17 @@ import pathlib
 import webbrowser
 import urllib.parse
 import http.server
+import socketserver
 import threading
 import tempfile
+import calendar
+import html
+import shlex
+import atexit
 from email.utils import parsedate_to_datetime
+from collections import OrderedDict
 
-# ── Google Calendar imports (optional) ──────────────────────────────────
+# ── Google Calendar imports (optional) ────────────────────────────────────────
 try:
     from google.auth.transport.requests import Request as GoogleRequest
     from google.oauth2.credentials import Credentials as GoogleCreds
@@ -69,9 +77,9 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.4.0"
+__version__ = "2.4.2"
 
-# ── Platform detection ────────────────────────────────────────────────
+# ── Platform detection ────────────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 
@@ -81,7 +89,10 @@ def _which(name):
         cmd = ["where", name]
     else:
         cmd = ["which", name]
-    return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
 
 def _chmod_600(path):
     """Set restrictive permissions on a file. No-op on Windows."""
@@ -98,9 +109,10 @@ def _chmod_755(path):
     if not IS_WINDOWS:
         os.chmod(path, 0o755)
 
-# ── Paths ──────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 if IS_WINDOWS:
     appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
     CONFIG_DIR = os.path.join(appdata, "verify-code")
     STATE_DIR = os.path.join(appdata, "verify-code", "data")
     SERVICE_FILE = None  # no systemd on Windows
@@ -119,7 +131,7 @@ SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
 CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
 
-# ── IMAP Providers ────────────────────────────────────────────────────
+# ── IMAP Providers ────────────────────────────────────────────────────────────
 IMAP_PROVIDERS = {
     "gmail":      {"host": "imap.gmail.com",        "port": 993, "label": "Gmail"},
     "outlook":    {"host": "outlook.office365.com",  "port": 993, "label": "Outlook"},
@@ -128,7 +140,7 @@ IMAP_PROVIDERS = {
 
 DEFAULT_IMAP = (IMAP_PROVIDERS["gmail"]["host"], IMAP_PROVIDERS["gmail"]["port"])
 
-# ── Color helpers ──────────────────────────────────────────────────────
+# ── Color helpers ─────────────────────────────────────────────────────────────
 class Style:
     BOLD = "\033[1m"
     GREEN = "\033[92m"
@@ -146,20 +158,20 @@ def c(text, *styles):
 
 def print_banner():
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║         🔐  verify-code  v2.4  🔐        ║", Style.CYAN, Style.BOLD))
     print(c("  ║    Auto-copy codes · Find events · 💳 Sub  ║", Style.CYAN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
-# ── Known verification senders ─────────────────────────────────────────
+# ── Known verification senders ────────────────────────────────────────────────
 KNOWN_SENDERS = {
-    "github.com", "noreply.github.com", "notifications@github.com",
+    "github.com", "noreply.github.com", "notifications.github.com",
     "google.com", "accounts.google.com", "noreply.google.com",
     "noreply-accounts.google.com",
-    "amazon.com", "amazonaws.com", "signup.aws", "no-reply@signup.aws",
+    "amazon.com", "amazonaws.com", "signup.aws", "no-reply.signup.aws",
     "aws.amazon.com", "aws.com",
-    "gitlab.com", "noreply@gitlab.com",
+    "gitlab.com", "noreply.gitlab.com",
     "microsoft.com", "accountprotection.microsoft.com",
     "login.microsoftonline.com", "microsoftonline.com",
     "apple.com", "appleid.apple.com",
@@ -231,16 +243,16 @@ KNOWN_SENDERS = {
     "fly.io",
 }
 
-# ── Code extraction regexes ────────────────────────────────────────────
+# ── Code extraction regexes ───────────────────────────────────────────────────
 RE_EXPLICIT = re.compile(
     r"(?:verification|confirm(?:ation)?|otp|one[- ]?time|security|login|log[- ]?in|"
     r"sign[- ]?in|signup|sign[- ]?up|activate|access|2fa|two[- ]?factor|account|"
     r"passcode|magic|mfa|multi[- ]?factor|auth|authenticator|temporary)\b"
-    r"[\s:=-]*(?:code|pin|number|token|link|key)?[\s:=-]*(?:is|[:=])?\s*"
+    r"[\s:=-]*(?:code|pin|number|token|link|key)?[\s:=-]*(?:is|[:=])?[\s:=-]*"
     r"(?=[A-Za-z0-9-]*\d)([A-Za-z0-9]{3,8}(?:[- ][A-Za-z0-9]{3,8})?)",
     re.I,
 )
-RE_ALPHANUM = re.compile(r"\b([A-Z0-9]{2,8}(?:-|_)?[A-Z0-9]{2,8})\b")
+RE_ALPHANUM = re.compile(r"\b((?=[A-Z0-9]*\d)[A-Z0-9]{2,8}(?:-|_)?[A-Z0-9]{2,8})\b")
 RE_GROUPED = re.compile(r"\b([0-9]{3}[ -][0-9]{3})\b")
 RE_PLAIN_STRICT = re.compile(r"\b([0-9]{5,8})\b")
 RE_PLAIN_4 = re.compile(r"\b([0-9]{4})\b")
@@ -252,7 +264,7 @@ CONTEXT_WORDS = re.compile(
     re.I,
 )
 
-# ── Date/time extraction patterns ──────────────────────────────────────
+# ── Date/time extraction patterns ─────────────────────────────────────────────
 RE_DATE_FULL = re.compile(
     r"(?:(?:on|for|date|time|when|departure|arrival|check[- ]?in|checkout|"
     r"starts|start|begins|begin|scheduled|confirmed|reserved)\s*[:]?\s*)?"
@@ -283,7 +295,6 @@ RE_DATE_MONTH_DAY = re.compile(
     r")?",
     re.I,
 )
-RE_FLIGHT = re.compile(r"\b([A-Z]{2}\d{1,4})\b")
 RE_TIME = re.compile(
     r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)"
     r"(?:\s*(?:to|-|–|until)\s*"
@@ -312,12 +323,16 @@ EVENT_KEYWORDS = {
                  "estimated", "tracking"],
 }
 
-# ── Global state for secure clipboard ───────────────────────────────────
+# ── Global state for secure clipboard ─────────────────────────────────────────
 _CLIPBOARD_GEN = 0
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def is_path_in_env(local_bin, env_var="PATH"):
+    paths = os.environ.get(env_var, "").split(os.pathsep)
+    return os.path.abspath(local_bin) in [os.path.abspath(p) for p in paths if p]
 
 def load_creds():
     if not os.path.exists(CRED_FILE):
@@ -371,7 +386,7 @@ def load_state():
     if "seen_subscriptions" not in data:
         data["seen_subscriptions"] = []
     for k in ("last_uid", "seen_codes", "last_time"):
-        if k not in data:
+        if k not in data or data[k] is None:
             return default
     if "seen_events" not in data:
         data["seen_events"] = []
@@ -396,11 +411,15 @@ def log_event(sender, subject, code=None, event=None):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = {"ts": ts, "sender": sender, "subject": subject}
+        if code:
+            entry["type"] = "CODE"
+            entry["code"] = code
+        if event:
+            entry["type"] = "EVENT"
+            entry["event"] = event
         with open(LOG_FILE, "a") as f:
-            if code:
-                f.write(f"[{ts}] CODE sender={sender} subject={subject!r} code={code}\n")
-            if event:
-                f.write(f"[{ts}] EVENT sender={sender} subject={subject!r} event={event}\n")
+            f.write(json.dumps(entry) + "\n")
         _chmod_600(LOG_FILE)
     except Exception:
         pass
@@ -410,7 +429,8 @@ def _subscription_key(sub: dict) -> str:
     service = sub.get("service", "unknown")
     plan = sub.get("plan", "")
     amount = sub.get("amount", "")
-    return f"{service}:{plan}:{amount}"
+    cycle = sub.get("billing_cycle", "")
+    return f"{service}:{plan}:{amount}:{cycle}"
 
 
 def load_subscriptions() -> list[dict]:
@@ -427,9 +447,13 @@ def save_subscription(sub: dict):
     existing = False
     for i, s in enumerate(subs):
         if _subscription_key(s) == key:
-            subs[i] = {**s, **sub}
+            merged = {**s}
+            for k, v in sub.items():
+                if v is not None:
+                    merged[k] = v
             if s.get("next_billing") and sub.get("next_billing"):
-                subs[i]["next_billing"] = min(s["next_billing"], sub["next_billing"])
+                merged["next_billing"] = min(s["next_billing"], sub["next_billing"])
+            subs[i] = merged
             existing = True
             break
     if not existing:
@@ -437,8 +461,12 @@ def save_subscription(sub: dict):
     subs = subs[-200:]
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(SUBSCRIPTIONS_FILE, "w") as f:
+        tmp = SUBSCRIPTIONS_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(subs, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SUBSCRIPTIONS_FILE)
         _chmod_600(SUBSCRIPTIONS_FILE)
     except Exception:
         pass
@@ -447,12 +475,14 @@ def save_subscription(sub: dict):
 def notify(title, body):
     if IS_WINDOWS:
         try:
+            ps_title = title.replace("'", "''").replace('"', '`"')
+            ps_body = body.replace("'", "''").replace('"', '`"')
             ps_script = f'''
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
  $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
  $textNodes = $template.GetElementsByTagName("text")
- $textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) > $null
- $textNodes.Item(1).AppendChild($template.CreateTextNode("{body.replace('"', "'")}")) > $null
+ $textNodes.Item(0).AppendChild($template.CreateTextNode('{ps_title}')) > $null
+ $textNodes.Item(1).AppendChild($template.CreateTextNode('{ps_body}')) > $null
  $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("verify-code").Show($toast)
 '''
@@ -462,7 +492,7 @@ def notify(title, body):
     elif IS_MACOS:
         try:
             subprocess.run(["osascript", "-e",
-                f'display notification "{body.replace(chr(34), "")}" with title "{title}"'],
+                f'display notification {shlex.quote(body)} with title {shlex.quote(title)}'],
                 capture_output=True, timeout=5)
         except Exception:
             pass
@@ -474,7 +504,6 @@ def notify(title, body):
 
 
 def copy_clipboard(text):
-    # FIX: Only strip whitespace. Do NOT strip hyphens, as URLs contain them.
     text = text.strip()
     for cmd, backend in [
         (["powershell", "-Command", "$input | Set-Clipboard"], "windows"),
@@ -492,10 +521,6 @@ def copy_clipboard(text):
                 else:
                     continue
             if _which(cmd[0]):
-                # FIX: Use DEVNULL instead of capture_output=True.
-                # wl-copy and xclip fork a background process to keep the clipboard alive.
-                # If we capture output, Python waits for the pipe to close, which blocks 
-                # forever and causes a TimeoutExpired exception.
                 res = subprocess.run(
                     cmd, 
                     input=text.encode(), 
@@ -520,7 +545,6 @@ def erase_clipboard():
                     return
                 continue
             if _which(cmd[0]):
-                # FIX: Redirect to DEVNULL so Python doesn't block waiting for the background process
                 subprocess.run(cmd, input=b" " * 20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                 return
         except (subprocess.TimeoutExpired, OSError):
@@ -537,19 +561,19 @@ def secure_copy_clipboard(text, timeout=30):
         
         def _erase():
             time.sleep(timeout)
-            # Only erase if no newer code/link has been copied!
             if my_gen == _CLIPBOARD_GEN:
                 erase_clipboard()
                 
         t = threading.Thread(target=_erase, daemon=True)
         t.start()
+        atexit.register(erase_clipboard)
     return backend
 
 
 def get_email_bodies(msg):
     """Extract plain text and raw HTML from email, with proper charset handling."""
     if msg.is_multipart():
-        plain = html = None
+        plain = html_body = None
         for part in msg.walk():
             ct = part.get_content_type()
             if ct == "text/plain" and plain is None:
@@ -563,21 +587,21 @@ def get_email_bodies(msg):
                             plain = payload.decode("utf-8", errors="replace")
                 except Exception:
                     pass
-            elif ct == "text/html" and html is None:
+            elif ct == "text/html" and html_body is None:
                 try:
                     payload = part.get_payload(decode=True)
                     if payload:
                         charset = part.get_content_charset() or "utf-8"
                         try:
-                            html = payload.decode(charset, errors="replace")
+                            html_body = payload.decode(charset, errors="replace")
                         except LookupError:
-                            html = payload.decode("utf-8", errors="replace")
+                            html_body = payload.decode("utf-8", errors="replace")
                 except Exception:
                     pass
         if plain:
-            return plain, html
-        if html:
-            return html_to_text(html), html
+            return plain, html_body
+        if html_body:
+            return html_to_text(html_body), html_body
         return "", None
     try:
         body = msg.get_payload(decode=True)
@@ -596,56 +620,47 @@ def get_email_bodies(msg):
         return str(msg), None
 
 
-def html_to_text(html):
-    text = html
+def html_to_text(html_str):
+    text = html_str
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
     text = re.sub(r"</?(?:div|p|br|tr|li|h[1-6]|blockquote|section|article|header|footer)[^>]*>",
                   "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    entities = {
-        "&nbsp;": " ", "&amp;": "&", "&gt;": ">", "&lt;": "<",
-        "&quot;": '"', "&apos;": "'", "&#160;": " ", "&#39;": "'",
-        "&#x27;": "'", "&#x2F;": "/",
-    }
-    for a, b in entities.items():
-        text = text.replace(a, b)
+    text = html.unescape(text)
     text = re.sub(r"\n\s*\n", "\n", text)
     text = re.sub(r" +", " ", text)
     return text.strip()
 
-# ── Magic Link Extraction ─────────────────────────────────────────────
+# ── Magic Link Extraction ─────────────────────────────────────────────────────
 RE_A_TAG = re.compile(r'<a\s[^>]*href=["\'](?P<url>[^"\']+)["\'][^>]*>(?P<text>.*?)</a>', re.I | re.S)
 RE_LINK_BLACKLIST = re.compile(
     r"(?:unsubscribe|preferences|privacy|terms|facebook|twitter|linkedin|instagram|"
-    r"youtube|mailto|tel:|#|apple\.com|google\.com|play\.google|apps\.apple|"
+    r"youtube|mailto|tel:|#|apps\.apple|play\.google|"
     r"manage\snotifications|view\sin\sbrowser|download|app\sstore|google\splay|"
     r"contact\sus|support|help|faq|blog|newsletter|copyright|©)",
     re.I
 )
 
-def extract_magic_link(html, subject="", sender=""):
+def extract_magic_link(html_str, subject="", sender=""):
     """Find a verification/magic link in HTML email."""
-    if not html:
+    if not html_str:
         return None
         
     known_sender = is_known_sender(sender)
     
-    for m in RE_A_TAG.finditer(html):
-        url = m.group("url").strip()
+    for m in RE_A_TAG.finditer(html_str):
+        url = html.unescape(m.group("url").strip())
         text = re.sub(r'<[^>]+>', '', m.group("text")).strip()
         
-        # Must be a valid web URL
         if not url.startswith("http"):
             continue
             
-        # Check if the link text or URL itself has verification context
         has_context = bool(CONTEXT_WORDS.search(text) or CONTEXT_WORDS.search(url))
         is_blacklisted = bool(RE_LINK_BLACKLIST.search(text) or RE_LINK_BLACKLIST.search(url))
         
         if has_context and not is_blacklisted:
-            # If not from a known sender, require very strong context words to prevent phishing
             if not known_sender:
                 if not re.search(r"(?:verify|confirm|magic|authenticat|sign[\s-]?in|log[\s-]?in)", text, re.I):
                     continue
@@ -675,9 +690,9 @@ def is_known_sender(sender: str) -> bool:
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Code Extraction
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_code(text, subject="", sender=""):
     combined = f"{subject} {sender} {text[:2000]}"
@@ -722,14 +737,13 @@ def extract_code(text, subject="", sender=""):
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Date/Time + Event Extraction
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_datetime(text, subject="", sender=""):
     events = []
     body = text[:5000]
-    combined = f"{subject} {sender} {body}"
 
     if not DATEUTIL_AVAILABLE:
         return events
@@ -746,7 +760,7 @@ def extract_datetime(text, subject="", sender=""):
 
     title = subject.strip()
     title_clean = re.sub(
-        r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New)",
+        r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New:?\s*)+",
         "", title, flags=re.I
     ).strip(" :,;-\"'")
     if not title_clean:
@@ -761,7 +775,7 @@ def extract_datetime(text, subject="", sender=""):
         m = pat.search(body)
         if m:
             loc = m.group(1).strip()
-            if len(loc) > 3 and len(loc) < 100:
+            if 3 < len(loc) < 100:
                 location = loc
                 break
 
@@ -778,7 +792,7 @@ def extract_datetime(text, subject="", sender=""):
         try:
             dt = dateparser.parse(full_str, fuzzy=True, default=now)
             if dt and dt > datetime.datetime(2000, 1, 1):
-                found_dates.append((dt, 85))
+                found_dates.append((dt, 85, m.group(0)))
         except (ValueError, TypeError):
             pass
 
@@ -795,7 +809,7 @@ def extract_datetime(text, subject="", sender=""):
             if dt and dt > datetime.datetime(2000, 1, 1):
                 key = dt.strftime("%Y%m%d%H%M")
                 if key not in seen_dates:
-                    found_dates.append((dt, 80))
+                    found_dates.append((dt, 80, m.group(0)))
                     seen_dates.add(key)
         except (ValueError, TypeError):
             pass
@@ -812,7 +826,7 @@ def extract_datetime(text, subject="", sender=""):
                         dt = dateparser.parse(full, fuzzy=False)
                     except (ValueError, TypeError):
                         pass
-                found_dates.append((dt, 70))
+                found_dates.append((dt, 70, m.group(0)))
         except (ValueError, TypeError):
             pass
 
@@ -821,7 +835,7 @@ def extract_datetime(text, subject="", sender=""):
         if len(parts) == 3:
             try:
                 parts = [int(p) for p in parts]
-                if parts[0] <= 12 and parts[0] >= 1 and parts[1] <= 31 and parts[2] >= 2020:
+                if 1 <= parts[0] <= 12 and 1 <= parts[1] <= 31 and parts[2] >= 2020:
                     nearby = body[m.end():m.end() + 60]
                     time_m = RE_TIME.search(nearby)
                     dt = datetime.datetime(parts[2], parts[0], parts[1])
@@ -833,37 +847,44 @@ def extract_datetime(text, subject="", sender=""):
                             dt = dt.replace(hour=12)
                     else:
                         dt = dt.replace(hour=12)
-                    found_dates.append((dt, 60))
+                    found_dates.append((dt, 60, m.group(0)))
             except (ValueError, TypeError):
                 pass
 
     seen = set()
     unique_dates = []
-    for dt, conf in found_dates:
+    for dt, conf, match_str in found_dates:
         key = dt.strftime("%Y%m%d%H%M")
         if key not in seen:
             seen.add(key)
-            unique_dates.append((dt, conf))
+            unique_dates.append((dt, conf, match_str))
 
     unique_dates.sort(key=lambda x: -x[1])
 
-    for dt, conf in unique_dates:
+    for dt, conf, match_str in unique_dates:
         if dt < now - datetime.timedelta(days=1):
             continue
 
         end_dt = None
-        time_text = body[max(0, body.lower().find(dt.strftime("%B")) - 20):
-                         body.lower().find(dt.strftime("%B")) + 120]
-        range_m = re.search(
-            r"(?:to|-|–|until)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)",
-            time_text, re.I
-        )
-        if range_m:
-            try:
-                end_str = dt.strftime("%Y-%m-%d") + " " + range_m.group(1)
-                end_dt = dateparser.parse(end_str, fuzzy=False)
-            except (ValueError, TypeError):
-                pass
+        try:
+            pos = body.lower().find(match_str.lower())
+            if pos != -1:
+                time_text = body[max(0, pos - 20):pos + len(match_str) + 120]
+            else:
+                time_text = body
+            
+            range_m = re.search(
+                r"(?:to|-|–|until)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)",
+                time_text, re.I
+            )
+            if range_m:
+                try:
+                    end_str = dt.strftime("%Y-%m-%d") + " " + range_m.group(1)
+                    end_dt = dateparser.parse(end_str, fuzzy=False)
+                except (ValueError, TypeError):
+                    pass
+        except Exception:
+            pass
 
         if end_dt is None:
             end_dt = dt + datetime.timedelta(hours=1)
@@ -882,9 +903,9 @@ def extract_datetime(text, subject="", sender=""):
     return events
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Subscription Tracking
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SUBSCRIPTION_SENDERS = {
     "netflix.com": "Netflix", "mailer.netflix.com": "Netflix",
@@ -958,7 +979,7 @@ SUBSCRIPTION_SENDERS = {
     "washingtonpost.com": "Washington Post",
     "theatlantic.com": "The Atlantic",
     "economist.com": "The Economist",
-    "nintendo.com": "Nintendo Switch Online",
+    "nintendo.com": "Nintendo", 
     "playstation.com": "PlayStation Plus",
     "xbox.com": "Xbox Game Pass",
     "roblox.com": "Roblox Premium",
@@ -1069,7 +1090,7 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
     plan_m = RE_PLAN_NAME.search(body)
     if plan_m:
         candidate = plan_m.group(1).strip()
-        if len(candidate) < 30 and not re.search(r"(?:will|your|this|that|has|have|been|with|for|the|and|our|we|you|to|is|are|was|on|at|it|in)", candidate, re.I):
+        if len(candidate) < 30 and not re.search(r"\b(?:will|your|this|that|has|have|been|with|for|the|and|our|we|you|to|is|are|was|on|at|it|in)\b", candidate, re.I):
             plan = candidate
     if plan is None:
         plan_m2 = re.search(
@@ -1184,10 +1205,12 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     if service_name is None:
         domain = _sender_domain(sender)
-        service_name = domain.replace("mail.", "").replace("message.", "") \
-            .replace("noreply.", "").replace("accounts.", "") \
-            .replace("account.", "").replace("e.", "") \
-            .split(".")[0].title()
+        # Safely strip known prefixes
+        for prefix in ["mail.", "message.", "noreply.", "accounts.", "account.", "e."]:
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+                break
+        service_name = domain.split(".")[0].title()
 
     result = {
         "service": service_name or "Unknown",
@@ -1247,9 +1270,9 @@ def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -
     return warnings
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Google Calendar Integration
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
@@ -1395,26 +1418,40 @@ def add_event_to_calendar(event):
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # IMAP / Email
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def connect(creds):
     ctx = ssl.create_default_context()
-    con = imaplib.IMAP4_SSL(creds["host"], int(creds["port"]), ssl_context=ctx)
+    port = int(creds.get("port", 993))
+    con = imaplib.IMAP4_SSL(creds["host"], port, ssl_context=ctx)
     con.login(creds["email"], creds["password"])
     con.select("INBOX")
     return con
 
 
-def find_newest_code(con, window, since_uid=0, known_senders_only=False):
+def _parse_email_date(date_str):
+    try:
+        date = parsedate_to_datetime(date_str)
+        if date is None:
+            return None
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=datetime.timezone.utc)
+        return date.astimezone(datetime.timezone.utc)
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def find_newest_code(con, window, since_uid=0, known_senders_only=False, find_all=False):
     """Return dict with code, sender, subject, age, uid, confidence, method, events, max_uid_seen."""
     now = datetime.datetime.now(datetime.timezone.utc)
     uids = []
     
-    since = (now - window).strftime("%d-%b-%Y")
+    # IMAP SINCE is strictly a date, no time. We must use yesterday to avoid edge cases.
+    since_date = (now - window - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
     try:
-        typ, data = con.uid('SEARCH', None, "SINCE", since)
+        typ, data = con.uid('SEARCH', None, "SINCE", since_date)
         if typ == "OK" and data and data[0]:
             uids = data[0].split()
     except (imaplib.IMAP4.error, AttributeError):
@@ -1429,6 +1466,7 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
 
     best_result = None
     newest_uid_seen = since_uid
+    all_results = []
 
     for uid in reversed(new_uids):
         uid_int = int(uid)
@@ -1444,12 +1482,11 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
             if known_senders_only and not is_known_sender(sender):
                 continue
 
-            date = parsedate_to_datetime(head.get("Date", ""))
+            date = _parse_email_date(head.get("Date", ""))
             if date is None:
                 continue
-            if date.tzinfo is None:
-                date = date.replace(tzinfo=datetime.timezone.utc)
-            age = now - date.astimezone(datetime.timezone.utc)
+            
+            age = now - date
             if age > window:
                 continue
 
@@ -1477,13 +1514,18 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False):
                 "max_uid_seen": newest_uid_seen
             }
 
-            if result and result.get("code"):
-                return candidate
-                
-            if best_result is None:
-                best_result = candidate
+            if find_all:
+                all_results.append(candidate)
+            else:
+                if result and result.get("code"):
+                    return candidate
+                if best_result is None:
+                    best_result = candidate
         except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError, IndexError):
             continue
+
+    if find_all:
+        return all_results
 
     if best_result is None:
         return {"uid": str(newest_uid_seen), "max_uid_seen": newest_uid_seen, "code": None,
@@ -1501,9 +1543,9 @@ def supports_idle(con):
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Setup Wizard
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def setup():
     """Interactive, fun setup wizard."""
@@ -1612,15 +1654,15 @@ def setup():
             save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                        provider=provider, cal_token=cal_ok, secure=secure_seconds > 0, secure_timeout=secure_seconds)
             print()
-            print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+            print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
             print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
-            print(c("  ╠══════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
+            print(c("  ╠══════════════════════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
             print(c(f"  ║  ✉️  Provider:   {provider_info['label']:<15}         ║", Style.GREEN))
             print(c(f"  ║  📅  Calendar:    {'Connected' if cal_ok else 'Not set up':<30} ║", Style.GREEN))
             print(c(f"  ║  📋  Clipboard:   {'Ready' if clipboard_ok else 'Missing tool':<30} ║", Style.GREEN))
             if secure_seconds > 0:
                 print(c(f"  ║  🔒  Secure:      {secure_seconds}s auto-erase        ║", Style.GREEN))
-            print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+            print(c("  ╚══════════════════════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
             print()
             print(c("  What now?", Style.BOLD))
             print("  •  verify-code              — one-shot: copy latest code/link")
@@ -1637,20 +1679,23 @@ def setup():
             local_bin = os.path.expanduser("~/.local/bin")
             local_script = os.path.join(local_bin, "verify-code")
             script_path = os.path.abspath(sys.argv[0])
-            if os.path.abspath(local_script) != os.path.abspath(script_path):
+            if os.path.abspath(local_script) != os.path.abspath(script_path) and script_path != "-":
                 ans = input(c("  📋  Copy verify-code to ~/.local/bin/? (Y/n): ", Style.BOLD)).strip().lower()
                 if ans != "n":
                     os.makedirs(local_bin, exist_ok=True)
-                    with open(script_path) as f:
-                        content = f.read()
-                    with open(local_script, "w") as f:
-                        f.write(content)
-                    _chmod_755(local_script)
-                    print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
-                    if local_bin not in os.environ.get("PATH", ""):
-                        print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
-                        print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
-                        print(f"     source ~/.bashrc")
+                    try:
+                        with open(script_path) as f:
+                            content = f.read()
+                        with open(local_script, "w") as f:
+                            f.write(content)
+                        _chmod_755(local_script)
+                        print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
+                        if not is_path_in_env(local_bin):
+                            print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+                            print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+                            print(f"     source ~/.bashrc")
+                    except Exception as e:
+                        print(c(f"  ✗  Failed to copy script: {e}", Style.RED))
             print()
             return
 
@@ -1783,15 +1828,15 @@ def setup():
                    provider=provider, cal_token=cal_ok, secure=True, secure_timeout=secure_seconds)
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
-    print(c("  ╠══════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
+    print(c("  ╠══════════════════════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
     print(c(f"  ║  ✉️  Provider:   {provider_info['label']:<15}         ║", Style.GREEN))
     print(c(f"  ║  📅  Calendar:    {'Connected' if cal_ok else 'Not set up':<30} ║", Style.GREEN))
     print(c(f"  ║  📋  Clipboard:   {'Ready' if clipboard_ok else 'Missing tool':<30} ║", Style.GREEN))
     if secure_seconds > 0:
         print(c(f"  ║  🔒  Secure:      {secure_seconds}s auto-erase        ║", Style.GREEN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print(c("  What now?", Style.BOLD))
     print("  •  verify-code              — one-shot: copy latest code/link")
@@ -1809,26 +1854,29 @@ def setup():
     local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
     script_path = os.path.abspath(sys.argv[0])
-    if os.path.abspath(local_script) != os.path.abspath(script_path):
+    if os.path.abspath(local_script) != os.path.abspath(script_path) and script_path != "-":
         ans = input(c("  📋  Copy verify-code to ~/.local/bin/? (Y/n): ", Style.BOLD)).strip().lower()
         if ans != "n":
             os.makedirs(local_bin, exist_ok=True)
-            with open(script_path) as f:
-                content = f.read()
-            with open(local_script, "w") as f:
-                f.write(content)
-            _chmod_755(local_script)
-            print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
-            if local_bin not in os.environ.get("PATH", ""):
-                print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
-                print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
-                print(f"     source ~/.bashrc")
+            try:
+                with open(script_path) as f:
+                    content = f.read()
+                with open(local_script, "w") as f:
+                    f.write(content)
+                _chmod_755(local_script)
+                print(c(f"  ✅  Copied to {local_script}", Style.GREEN))
+                if not is_path_in_env(local_bin):
+                    print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
+                    print(f"     echo 'export PATH=\"$PATH:{local_bin}\"' >> ~/.bashrc")
+                    print(f"     source ~/.bashrc")
+            except Exception as e:
+                print(c(f"  ✗  Failed to copy script: {e}", Style.RED))
     print()
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Modes
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run(args):
     """One-shot mode: find and copy the newest code."""
@@ -1972,9 +2020,9 @@ def run(args):
 
 def history_cmd():
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   📋  verify-code history                ║", Style.CYAN, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
     if not os.path.exists(LOG_FILE):
@@ -1989,24 +2037,30 @@ def history_cmd():
         print(c(f"  ✗  Could not read history: {e}", Style.RED))
         return
 
-    code_entries = [l.strip() for l in lines if " CODE " in l]
+    code_entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line.strip())
+            if entry.get("type") == "CODE":
+                code_entries.append(entry)
+        except json.JSONDecodeError:
+            continue
+
     if not code_entries:
         print(c("  No codes have been copied yet.", Style.DIM))
         print()
         return
 
     for entry in code_entries[-10:]:
-        m = re.match(r"\[(.*?)\] CODE sender=(.*?) subject=(.*?) code=(.*)", entry)
-        if m:
-            ts, sender, subject, code = m.groups()
-            if code.startswith("LINK:"):
-                display = c("🔗 " + (code[5:] if len(code) <= 45 else code[5:42] + "..."), Style.GREEN, Style.BOLD)
-            else:
-                display = c(code, Style.GREEN, Style.BOLD)
-            print(f"  {c(ts, Style.DIM)}  {display}  "
-                  f"from {c(sender[:30], Style.DIM)}")
+        ts = entry.get("ts", "?")
+        sender = entry.get("sender", "?")
+        code = entry.get("code", "")
+        if code.startswith("LINK:"):
+            display = c("🔗 " + (code[5:] if len(code) <= 45 else code[5:42] + "..."), Style.GREEN, Style.BOLD)
         else:
-            print(f"  {entry}")
+            display = c(code, Style.GREEN, Style.BOLD)
+        print(f"  {c(ts, Style.DIM)}  {display}  "
+              f"from {c(sender[:30], Style.DIM)}")
 
     print()
     print(c(f"  Showing {min(len(code_entries), 10)} of {len(code_entries)} total entries.", Style.DIM))
@@ -2020,9 +2074,9 @@ def subscriptions_cmd(args):
     subs = load_subscriptions()
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   💳  Subscription Tracker              ║", Style.CYAN, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
     if not subs:
@@ -2033,7 +2087,7 @@ def subscriptions_cmd(args):
         print()
         return
 
-    warn_days = args.warn_days if args.warn_days else 3
+    warn_days = args.warn_days if args.warn_days is not None else 3
     warnings = check_subscription_warnings(subs, warn_days=warn_days)
 
     if warnings:
@@ -2092,9 +2146,9 @@ def subscriptions_cmd(args):
         print(f"     {len(subs_sorted) - len(active)} cancelled")
     print()
 
-    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+    print(c("  ──────────────────────────────────────────────────────────", Style.DIM))
     print(c("  Service           Plan        Amount   Cycle     Next Billing", Style.BOLD))
-    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+    print(c("  ──────────────────────────────────────────────────────────", Style.DIM))
 
     for sub in subs_sorted:
         service = sub["service"][:18].ljust(18)
@@ -2125,7 +2179,7 @@ def subscriptions_cmd(args):
 
         print(f"  {service}{plan}{amount} {cycle}{next_bill}{status_mark}")
 
-    print(c("  ────────────────────────────────────────────────────────", Style.DIM))
+    print(c("  ──────────────────────────────────────────────────────────", Style.DIM))
     print()
     print(c("  Tip:", Style.DIM), "subscriptions are auto-detected from inbox emails.")
     print(c("  Run:", Style.DIM), "verify-code daemon  (to track in background automatically)")
@@ -2134,8 +2188,6 @@ def subscriptions_cmd(args):
 
 def dashboard_cmd(args):
     """Launch a local web dashboard showing subscriptions, code history, and events."""
-    import socketserver
-
     DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2160,11 +2212,8 @@ def dashboard_cmd(args):
     --brass: #9C7C34;
     --red: #9B3A2C;
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   html { -webkit-font-smoothing: antialiased; }
-
   body {
     font-family: 'Spectral', Georgia, serif;
     background: var(--paper);
@@ -2172,7 +2221,6 @@ def dashboard_cmd(args):
     min-height: 100vh;
     position: relative;
   }
-
   body::before {
     content: '';
     position: fixed;
@@ -2182,167 +2230,58 @@ def dashboard_cmd(args):
     pointer-events: none;
     z-index: 5;
   }
-
-  .page {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 44px 32px 80px 56px;
-  }
-
+  .page { max-width: 980px; margin: 0 auto; padding: 44px 32px 80px 56px; }
   .masthead {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 24px;
-    padding-bottom: 22px;
-    border-bottom: 3px double var(--rule-strong);
-    margin-bottom: 28px;
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 24px; padding-bottom: 22px; border-bottom: 3px double var(--rule-strong); margin-bottom: 28px;
   }
-  .masthead-title {
-    font-family: 'Fraunces', serif;
-    font-weight: 600;
-    font-size: 40px;
-    letter-spacing: -0.01em;
-    color: var(--ink);
-    line-height: 1;
-  }
+  .masthead-title { font-family: 'Fraunces', serif; font-weight: 600; font-size: 40px; letter-spacing: -0.01em; color: var(--ink); line-height: 1; }
   .masthead-title .key { color: var(--green); font-style: italic; font-weight: 500; }
-  .masthead-sub {
-    font-style: italic;
-    color: var(--ink-dim);
-    font-size: 15px;
-    margin-top: 8px;
-  }
-  .masthead-right {
-    text-align: right;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 10px;
-  }
-  .stamped-time {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-faint);
-  }
+  .masthead-sub { font-style: italic; color: var(--ink-dim); font-size: 15px; margin-top: 8px; }
+  .masthead-right { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .stamped-time { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); }
   .stamped-time b { color: var(--ink-dim); font-weight: 600; }
   .refresh-stamp {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    background: transparent;
-    color: var(--green);
-    border: 1.5px solid var(--green);
-    border-radius: 3px;
-    padding: 7px 14px;
-    cursor: pointer;
-    transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    background: transparent; color: var(--green); border: 1.5px solid var(--green); border-radius: 3px; padding: 7px 14px;
+    cursor: pointer; transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
   }
   .refresh-stamp:hover { background: var(--green); color: var(--paper); }
   .refresh-stamp:active { transform: scale(0.96) rotate(-1deg); }
   .refresh-stamp.spinning { animation: pulse 0.6s ease; }
   @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(0.94) rotate(-2deg); } 100% { transform: scale(1); } }
-
   .balance-line {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    background: var(--paper-deep);
-    border-top: 1px solid var(--rule-strong);
-    border-bottom: 1px solid var(--rule-strong);
-    margin-bottom: 32px;
+    display: grid; grid-template-columns: repeat(4, 1fr); background: var(--paper-deep);
+    border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); margin-bottom: 32px;
   }
-  .balance-item {
-    padding: 16px 20px;
-    border-left: 1px solid var(--rule);
-    text-align: left;
-  }
+  .balance-item { padding: 16px 20px; border-left: 1px solid var(--rule); text-align: left; }
   .balance-item:first-child { border-left: none; }
-  .balance-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--ink-dim);
-    display: block;
-    margin-bottom: 6px;
-  }
-  .balance-value {
-    font-family: 'Fraunces', serif;
-    font-size: 32px;
-    font-weight: 600;
-    line-height: 1;
-  }
+  .balance-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); display: block; margin-bottom: 6px; }
+  .balance-value { font-family: 'Fraunces', serif; font-size: 32px; font-weight: 600; line-height: 1; }
   .balance-value.c-green { color: var(--green); }
   .balance-value.c-brass { color: var(--brass); }
   .balance-value.c-ink { color: var(--ink); }
   .balance-value.c-red { color: var(--red); }
-  .balance-sub {
-    font-size: 12px;
-    color: var(--ink-faint);
-    margin-top: 4px;
-    font-style: italic;
-  }
-
-  .tab-bar {
-    display: flex;
-    gap: 6px;
-    padding-left: 4px;
-  }
+  .balance-sub { font-size: 12px; color: var(--ink-faint); margin-top: 4px; font-style: italic; }
+  .tab-bar { display: flex; gap: 6px; padding-left: 4px; }
   .tab-btn {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    background: var(--paper-deeper);
-    color: var(--ink-dim);
-    border: 1px solid var(--rule-strong);
-    border-bottom: none;
-    padding: 9px 18px 8px;
-    cursor: pointer;
-    clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
-    position: relative;
-    top: 1px;
-    transition: all 0.15s ease;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase;
+    background: var(--paper-deeper); color: var(--ink-dim); border: 1px solid var(--rule-strong); border-bottom: none;
+    padding: 9px 18px 8px; cursor: pointer; clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+    position: relative; top: 1px; transition: all 0.15s ease;
   }
   .tab-btn:hover { color: var(--ink); }
-  .tab-btn.active {
-    background: var(--paper);
-    color: var(--green-deep);
-    font-weight: 600;
-    border-bottom: 1px solid var(--paper);
-    top: 0;
-    padding-top: 10px;
-  }
-
-  .ledger-panel {
-    border: 1px solid var(--rule-strong);
-    border-top: none;
-    background: var(--paper);
-  }
+  .tab-btn.active { background: var(--paper); color: var(--green-deep); font-weight: 600; border-bottom: 1px solid var(--paper); top: 0; padding-top: 10px; }
+  .ledger-panel { border: 1px solid var(--rule-strong); border-top: none; background: var(--paper); }
   .tab-content { display: none; padding: 4px 0 0; }
   .tab-content.active { display: block; }
-
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    text-align: left;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--ink-dim);
-    padding: 12px 20px 10px;
-    border-bottom: 1.5px solid var(--rule-strong);
+    text-align: left; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-dim); padding: 12px 20px 10px; border-bottom: 1.5px solid var(--rule-strong);
   }
   thead th.num { text-align: right; }
-  tbody td {
-    padding: 13px 20px;
-    border-bottom: 1px solid var(--rule);
-    font-size: 14.5px;
-    vertical-align: middle;
-  }
+  tbody td { padding: 13px 20px; border-bottom: 1px solid var(--rule); font-size: 14.5px; vertical-align: middle; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover td { background: rgba(51,81,63,0.05); }
   td.num, th.num { text-align: right; font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
@@ -2350,77 +2289,36 @@ def dashboard_cmd(args):
   td.service { font-family: 'Fraunces', serif; font-weight: 600; font-size: 15px; }
   td.dim, span.dim { color: var(--ink-faint); }
   .code-cell {
-    font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600;
-    letter-spacing: 0.14em;
-    color: var(--green-deep);
-    background: rgba(51,81,63,0.08);
-    padding: 3px 8px;
-    border-radius: 2px;
+    font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing: 0.14em; color: var(--green-deep);
+    background: rgba(51,81,63,0.08); padding: 3px 8px; border-radius: 2px;
   }
-
+  .link-chip {
+    display: inline-flex; align-items: baseline; gap: 6px; max-width: 260px; font-family: 'IBM Plex Mono', monospace;
+    font-weight: 600; font-size: 12.5px; letter-spacing: 0.02em; color: var(--brass); background: rgba(156,124,52,0.09);
+    border: 1px solid rgba(156,124,52,0.4); padding: 3px 9px; border-radius: 2px; text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .link-chip:hover { background: rgba(156,124,52,0.18); border-color: var(--brass); }
+  .link-chip .arrow { font-size: 11px; flex-shrink: 0; }
+  .link-chip .host { overflow: hidden; text-overflow: ellipsis; }
   .stamp {
-    display: inline-block;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 10.5px;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    font-weight: 600;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1.5px solid currentColor;
-    transform: rotate(-3deg);
-    white-space: nowrap;
+    display: inline-block; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.09em;
+    text-transform: uppercase; font-weight: 600; padding: 3px 10px; border-radius: 999px; border: 1.5px solid currentColor;
+    transform: rotate(-3deg); white-space: nowrap;
   }
   .stamp-active { color: var(--green); }
   .stamp-trial { color: var(--brass); }
   .stamp-cancelled { color: var(--red); text-decoration: line-through; text-decoration-thickness: 1px; }
-  .flag-warn {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px;
-    color: var(--red);
-    font-weight: 600;
-  }
+  .flag-warn { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--red); font-weight: 600; }
   .flag-soon { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--brass); }
   .flag-far { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--ink-faint); }
-
-  .empty, .loading, .error {
-    padding: 56px 20px;
-    text-align: center;
-    font-style: italic;
-    color: var(--ink-dim);
-    font-size: 15px;
-  }
-  .empty code, .error code {
-    font-style: normal;
-    font-family: 'IBM Plex Mono', monospace;
-    background: var(--paper-deep);
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 13px;
-    color: var(--green-deep);
-  }
+  .empty, .loading, .error { padding: 56px 20px; text-align: center; font-style: italic; color: var(--ink-dim); font-size: 15px; }
+  .empty code, .error code { font-style: normal; font-family: 'IBM Plex Mono', monospace; background: var(--paper-deep); padding: 2px 6px; border-radius: 3px; font-size: 13px; color: var(--green-deep); }
   .error { color: var(--red); }
   .loading::after { content: ' …'; }
-
-  .totals-line {
-    padding: 10px 20px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px;
-    color: var(--ink-dim);
-    border-bottom: 1px solid var(--rule);
-    background: var(--paper-deep);
-  }
+  .totals-line { padding: 10px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--ink-dim); border-bottom: 1px solid var(--rule); background: var(--paper-deep); }
   .totals-line b { color: var(--green-deep); }
-
-  .footnote {
-    margin-top: 18px;
-    font-size: 12px;
-    color: var(--ink-faint);
-    font-style: italic;
-    text-align: center;
-  }
-
+  .footnote { margin-top: 18px; font-size: 12px; color: var(--ink-faint); font-style: italic; text-align: center; }
   @media (max-width: 720px) {
     .page { padding: 28px 16px 60px 32px; }
     .masthead { flex-direction: column; align-items: flex-start; }
@@ -2431,17 +2329,12 @@ def dashboard_cmd(args):
     thead th, tbody td { padding: 10px 12px; font-size: 13px; }
     .masthead-title { font-size: 30px; }
   }
-
-  @media (prefers-reduced-motion: reduce) {
-    .refresh-stamp.spinning { animation: none; }
-  }
-
+  @media (prefers-reduced-motion: reduce) { .refresh-stamp.spinning { animation: none; } }
   :focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 </style>
 </head>
 <body>
 <div class="page">
-
   <div class="masthead">
     <div>
       <div class="masthead-title"><span class="key">verify</span>-code</div>
@@ -2452,29 +2345,18 @@ def dashboard_cmd(args):
       <button class="refresh-stamp" id="refreshBtn" onclick="loadAll(true)">↻ Refresh entry</button>
     </div>
   </div>
-
   <div class="balance-line" id="stats"></div>
-
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="subscriptions" onclick="switchTab('subscriptions', this)">Subscriptions</button>
-    <button class="tab-btn" data-tab="codes" onclick="switchTab('codes', this)">Codes</button>
+    <button class="tab-btn" data-tab="codes" onclick="switchTab('codes', this)">Codes &amp; Links</button>
     <button class="tab-btn" data-tab="events" onclick="switchTab('events', this)">Events</button>
   </div>
-
   <div class="ledger-panel">
-    <div id="tab-subscriptions" class="tab-content active">
-      <div id="subscriptionsContent"><div class="loading">Reading the ledger</div></div>
-    </div>
-    <div id="tab-codes" class="tab-content">
-      <div id="codesContent"><div class="loading">Reading the ledger</div></div>
-    </div>
-    <div id="tab-events" class="tab-content">
-      <div id="eventsContent"><div class="loading">Reading the ledger</div></div>
-    </div>
+    <div id="tab-subscriptions" class="tab-content active"><div id="subscriptionsContent"><div class="loading">Reading the ledger</div></div></div>
+    <div id="tab-codes" class="tab-content"><div id="codesContent"><div class="loading">Reading the ledger</div></div></div>
+    <div id="tab-events" class="tab-content"><div id="eventsContent"><div class="loading">Reading the ledger</div></div></div>
   </div>
-
 </div>
-
 <script>
 function switchTab(name, btn) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -2482,7 +2364,6 @@ function switchTab(name, btn) {
   btn.classList.add('active');
   document.getElementById('tab-' + name).classList.add('active');
 }
-
 function fmtDate(d) {
   if (!d) return '—';
   const dt = new Date(d);
@@ -2518,71 +2399,51 @@ function statusStamp(status) {
 function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
-
-async function fetchJSON(url) {
-  try {
-    const r = await fetch(url);
-    return await r.json();
-  } catch (e) {
-    return [];
+function isMagicLink(raw) { return typeof raw === 'string' && raw.startsWith('LINK:'); }
+function formatCodeOrLink(raw) {
+  if (!raw) return '<span class="dim">?</span>';
+  if (isMagicLink(raw)) {
+    const url = raw.substring(5);
+    let host = url;
+    try { host = new URL(url).hostname.replace(/^www\./, ''); } catch (e) { /* leave as-is */ }
+    return `<a class="link-chip" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(url)}"><span class="arrow">↗</span><span class="host">${esc(host)}</span></a>`;
   }
+  return `<span class="code-cell">${esc(raw)}</span>`;
 }
-
+async function fetchJSON(url) {
+  try { const r = await fetch(url); return await r.json(); } catch (e) { return []; }
+}
 async function loadAll(userTriggered) {
   const btn = document.getElementById('refreshBtn');
   if (userTriggered && btn) { btn.classList.remove('spinning'); void btn.offsetWidth; btn.classList.add('spinning'); }
   document.getElementById('lastUpdated').textContent = 'turning the page…';
-
   let subs, logEntries;
   try {
-    [subs, logEntries] = await Promise.all([
-      fetchJSON('/api/subscriptions'),
-      fetchJSON('/api/log'),
-    ]);
+    [subs, logEntries] = await Promise.all([fetchJSON('/api/subscriptions'), fetchJSON('/api/log')]);
   } catch (e) {
     document.getElementById('lastUpdated').textContent = 'Error loading data';
     ['subscriptionsContent', 'codesContent', 'eventsContent'].forEach(id => {
-      document.getElementById(id).innerHTML =
-        '<div class="error">Failed to read the ledger. Make sure the daemon has been run at least once.</div>';
+      document.getElementById(id).innerHTML = '<div class="error">Failed to read the ledger. Make sure the daemon has been run at least once.</div>';
     });
     return;
   }
-
   const now = new Date();
-  document.getElementById('lastUpdated').innerHTML =
-    'Last entry stamped <b>' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</b>';
-
+  document.getElementById('lastUpdated').innerHTML = 'Last entry stamped <b>' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</b>';
   const activeSubs = subs.filter(s => s.status !== 'cancelled');
   const codes = logEntries.filter(e => e.type === 'CODE');
+  const linkCount = codes.filter(e => isMagicLink(e.code)).length;
+  const plainCodeCount = codes.length - linkCount;
   const events = logEntries.filter(e => e.type === 'EVENT');
   const warnings = subs.filter(s => {
     const d = daysUntil(s.next_billing || s.trial_end);
     return d !== null && d >= 0 && d <= 3;
   }).length;
-
   document.getElementById('stats').innerHTML = `
-    <div class="balance-item">
-      <span class="balance-label">Subscriptions</span>
-      <div class="balance-value c-green">${activeSubs.length}</div>
-      <div class="balance-sub">${subs.length - activeSubs.length} cancelled</div>
-    </div>
-    <div class="balance-item">
-      <span class="balance-label">Codes copied</span>
-      <div class="balance-value c-ink">${codes.length}</div>
-      <div class="balance-sub">last ${codes.length ? fmtDate(codes[codes.length-1].ts) : '—'}</div>
-    </div>
-    <div class="balance-item">
-      <span class="balance-label">Events logged</span>
-      <div class="balance-value c-brass">${events.length}</div>
-      <div class="balance-sub">from the inbox</div>
-    </div>
-    <div class="balance-item">
-      <span class="balance-label">Due within 3 days</span>
-      <div class="balance-value c-red">${warnings}</div>
-      <div class="balance-sub">needs attention</div>
-    </div>
+    <div class="balance-item"><span class="balance-label">Subscriptions</span><div class="balance-value c-green">${activeSubs.length}</div><div class="balance-sub">${subs.length - activeSubs.length} cancelled</div></div>
+    <div class="balance-item"><span class="balance-label">Codes &amp; links</span><div class="balance-value c-ink">${codes.length}</div><div class="balance-sub">${plainCodeCount} codes &middot; ${linkCount} links</div></div>
+    <div class="balance-item"><span class="balance-label">Events logged</span><div class="balance-value c-brass">${events.length}</div><div class="balance-sub">from the inbox</div></div>
+    <div class="balance-item"><span class="balance-label">Due within 3 days</span><div class="balance-value c-red">${warnings}</div><div class="balance-sub">needs attention</div></div>
   `;
-
   const subsEl = document.getElementById('subscriptionsContent');
   if (subs.length === 0) {
     subsEl.innerHTML = '<div class="empty">No subscriptions tracked yet. Run <code>verify-code daemon</code> to open a ledger for them.</div>';
@@ -2608,53 +2469,28 @@ async function loadAll(userTriggered) {
     if (yearly > 0) parts.push(`<b>$${yearly.toFixed(2)}</b> / year`);
     totals += parts.length ? parts.join(' &nbsp;·&nbsp; ') : 'no recurring charges tracked';
     totals += '</div>';
-
     let rows = totals + '<table><thead><tr><th>Service</th><th>Plan</th><th class="num">Amount</th><th>Cycle</th><th>Next billing</th><th>Status</th></tr></thead><tbody>';
     sorted.forEach(s => {
       const nextDate = s.next_billing || s.trial_end || null;
       const days = daysUntil(nextDate);
       const nextHtml = nextDate ? `${fmtDate(nextDate)} &nbsp;${warnFlag(days)}` : '<span class="dim">—</span>';
-      rows += `<tr>
-        <td class="service">${esc(s.service)}</td>
-        <td>${s.plan ? esc(s.plan) : '<span class="dim">—</span>'}</td>
-        <td class="num">${s.amount ? esc(s.amount) : '<span class="dim">—</span>'}</td>
-        <td class="mono">${s.billing_cycle ? esc(s.billing_cycle) : '<span class="dim">—</span>'}</td>
-        <td class="mono">${nextHtml}</td>
-        <td>${statusStamp(s.status)}</td>
-      </tr>`;
+      rows += `<tr><td class="service">${esc(s.service)}</td><td>${s.plan ? esc(s.plan) : '<span class="dim">—</span>'}</td><td class="num">${s.amount ? esc(s.amount) : '<span class="dim">—</span>'}</td><td class="mono">${s.billing_cycle ? esc(s.billing_cycle) : '<span class="dim">—</span>'}</td><td class="mono">${nextHtml}</td><td>${statusStamp(s.status)}</td></tr>`;
     });
     rows += '</tbody></table>';
     subsEl.innerHTML = rows;
   }
-
   const codesEl = document.getElementById('codesContent');
   if (codes.length === 0) {
-    codesEl.innerHTML = '<div class="empty">No codes have been copied yet. Run <code>verify-code</code> to log the first entry.</div>';
+    codesEl.innerHTML = '<div class="empty">No codes or links have been copied yet. Run <code>verify-code</code> to log the first entry.</div>';
   } else {
-    let rows = '<table><thead><tr><th>Time</th><th>Code</th><th>From</th><th>Subject</th></tr></thead><tbody>';
+    let rows = '<table><thead><tr><th>Time</th><th>Code / Link</th><th>From</th><th>Subject</th></tr></thead><tbody>';
     [...codes].reverse().slice(0, 50).forEach(e => {
       const sender = e.sender || '?', subject = e.subject || '?';
-      let codeVal = e.code || '?';
-      let isLink = false;
-      if (codeVal.startsWith('LINK:')) {
-          isLink = true;
-          codeVal = codeVal.substring(5);
-          if (codeVal.length > 40) codeVal = codeVal.substring(0, 37) + '...';
-      }
-      const codeHtml = isLink 
-          ? `<span class="code-cell">🔗 ${esc(codeVal)}</span>` 
-          : `<span class="code-cell">${esc(codeVal)}</span>`;
-      rows += `<tr>
-        <td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
-        <td>${codeHtml}</td>
-        <td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td>
-        <td class="dim">${esc(subject.length > 50 ? subject.slice(0, 50) + '…' : subject)}</td>
-      </tr>`;
+      rows += `<tr><td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td><td>${formatCodeOrLink(e.code)}</td><td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td><td class="dim">${esc(subject.length > 50 ? subject.slice(0, 50) + '…' : subject)}</td></tr>`;
     });
     rows += '</tbody></table>';
     codesEl.innerHTML = rows;
   }
-
   const eventsEl = document.getElementById('eventsContent');
   if (events.length === 0) {
     eventsEl.innerHTML = '<div class="empty">No events extracted yet. Run <code>verify-code daemon</code> to start logging them.</div>';
@@ -2662,17 +2498,12 @@ async function loadAll(userTriggered) {
     let rows = '<table><thead><tr><th>Time</th><th>Event</th><th>From</th></tr></thead><tbody>';
     [...events].reverse().slice(0, 50).forEach(e => {
       const sender = e.sender || '?';
-      rows += `<tr>
-        <td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td>
-        <td>${esc(e.event || '?')}</td>
-        <td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td>
-      </tr>`;
+      rows += `<tr><td class="mono dim">${fmtDate(e.ts)} ${fmtTime(e.ts)}</td><td>${esc(e.event || '?')}</td><td>${esc(sender.length > 35 ? sender.slice(0, 35) + '…' : sender)}</td></tr>`;
     });
     rows += '</tbody></table>';
     eventsEl.innerHTML = rows;
   }
 }
-
 loadAll(false);
 setInterval(() => loadAll(false), 30000);
 </script>
@@ -2688,15 +2519,12 @@ setInterval(() => loadAll(false), 30000);
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(DASHBOARD_HTML.encode("utf-8"))
-
             elif parsed.path == "/api/subscriptions":
                 subs = load_subscriptions()
                 self._json_response(subs)
-
             elif parsed.path == "/api/state":
                 state = load_state()
                 self._json_response(state)
-
             elif parsed.path == "/api/log":
                 entries = []
                 if os.path.exists(LOG_FILE):
@@ -2704,28 +2532,14 @@ setInterval(() => loadAll(false), 30000);
                         with open(LOG_FILE) as f:
                             for line in f:
                                 line = line.strip()
-                                if not line:
-                                    continue
-                                entry = {"raw": line}
-                                m = re.match(
-                                    r"\[(.*?)\] (CODE|EVENT) sender=(.*?) subject=(.*?) (?:code|event)=(.*)",
-                                    line
-                                )
-                                if m:
-                                    entry["ts"] = m.group(1)
-                                    entry["type"] = m.group(2)
-                                    entry["sender"] = m.group(3)
-                                    entry["subject"] = m.group(4)
-                                    entry["value"] = m.group(5)
-                                    if m.group(2) == "CODE":
-                                        entry["code"] = m.group(5)
-                                    else:
-                                        entry["event"] = m.group(5)
-                                entries.append(entry)
+                                if not line: continue
+                                try:
+                                    entries.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    pass
                     except Exception:
                         pass
                 self._json_response(entries)
-
             else:
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json")
@@ -2748,28 +2562,26 @@ setInterval(() => loadAll(false), 30000);
             pass
 
     port = 8899
+    httpd = None
     for attempt in range(10):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(("127.0.0.1", port))
-            s.close()
+            httpd = socketserver.TCPServer(("127.0.0.1", port), DashHandler)
             break
         except OSError:
             port += 1
-    else:
+    if httpd is None:
         print(c("  ✗  Could not find a free port.", Style.RED))
         return
 
-    server = socketserver.TCPServer(("127.0.0.1", port), DashHandler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
     url = f"http://127.0.0.1:{port}"
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   📊  verify-code Dashboard             ║", Style.CYAN, Style.BOLD))
     print(c(f"  ║   {url:<34}  ║", Style.CYAN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
     print(c(f"  🌐  Dashboard: {url}", Style.GREEN, Style.BOLD))
     print(c("  🚪  Press Ctrl+C to stop the server.", Style.DIM))
@@ -2783,21 +2595,20 @@ setInterval(() => loadAll(false), 30000);
     except KeyboardInterrupt:
         print()
         print(c("  🛑  Dashboard server stopped.", Style.YELLOW))
-        server.shutdown()
+        httpd.shutdown()
 
 
 def daemon_run(args):
     """Background daemon mode: watch inbox, auto-copy codes, extract events."""
-    # Force subscription tracking ON automatically for the daemon
-    args.subscriptions = True
-    
     creds = load_creds()
     window = datetime.timedelta(minutes=args.minutes)
     state = load_state()
     last_uid = int(state.get("last_uid", 0))
-    seen_codes = set(state.get("seen_codes", []))
-    seen_events = set(state.get("seen_events", []))
-    seen_subscriptions = set(state.get("seen_subscriptions", []))
+    
+    seen_codes = OrderedDict((k, True) for k in state.get("seen_codes", []))
+    seen_events = OrderedDict((k, True) for k in state.get("seen_events", []))
+    seen_subscriptions = OrderedDict((k, True) for k in state.get("seen_subscriptions", []))
+    
     interval = args.interval
 
     have_calendar = bool(get_calendar_service())
@@ -2811,9 +2622,10 @@ def daemon_run(args):
     else:
         secure_timeout = 0
 
-    if not IS_WINDOWS and not _which("wl-copy"):
-        notify("verify-code", "wl-copy not found — install wl-clipboard for auto-copy.")
-        print(c("WARNING: wl-copy missing; codes will be logged but not copied.", Style.YELLOW), file=sys.stderr)
+    clipboard_available = IS_WINDOWS or IS_MACOS or _which("wl-copy") or _which("xclip")
+    if not clipboard_available:
+        notify("verify-code", "Clipboard tool missing — codes will be logged but not copied.")
+        print(c("WARNING: Clipboard tool missing; codes will be logged but not copied.", Style.YELLOW), file=sys.stderr)
 
     print(c(f"  🔐  verify-code daemon v{__version__} started", Style.CYAN, Style.BOLD))
     print(f"     Window: {args.minutes}m  |  Interval: {interval}s"
@@ -2830,7 +2642,7 @@ def daemon_run(args):
             con = connect(creds)
             use_idle = args.idle and supports_idle(con)
             if use_idle:
-                print(c(f"  [{datetime.datetime.now():%H:%M:%S}] IMAP IDLE disabled for stability. Polling mode active.", Style.DIM), flush=True)
+                print(c(f"  [{datetime.datetime.now():%H:%M:%S}] IMAP IDLE supported, but using polling for stability.", Style.DIM), flush=True)
             else:
                 print(f"  [{datetime.datetime.now():%H:%M:%S}] {c('Polling', Style.DIM)} mode ({interval}s).", flush=True)
 
@@ -2846,15 +2658,14 @@ def daemon_run(args):
                     continue
 
                 now_ts = datetime.datetime.now().strftime("%H:%M:%S")
-
                 last_uid = max(last_uid, int(res.get("max_uid_seen", res["uid"])))
 
                 if not res.get("code") and not res.get("link") and not res.get("events") and not (args.subscriptions and res.get("body")):
                     save_state({
                         "last_uid": last_uid,
-                        "seen_codes": list(seen_codes),
-                        "seen_events": list(seen_events),
-                        "seen_subscriptions": list(seen_subscriptions),
+                        "seen_codes": list(seen_codes.keys()),
+                        "seen_events": list(seen_events.keys()),
+                        "seen_subscriptions": list(seen_subscriptions.keys()),
                         "last_time": datetime.datetime.now().isoformat(),
                     })
                     if not use_idle:
@@ -2864,7 +2675,6 @@ def daemon_run(args):
                         time.sleep(interval)
                     continue
 
-                # ── Handle code ──
                 if res["code"]:
                     dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['code'])}"
                     if dedup_key in seen_codes:
@@ -2873,25 +2683,21 @@ def daemon_run(args):
                         try:
                             if secure_timeout > 0:
                                 secure_copy_clipboard(res["code"], timeout=secure_timeout)
-                                notify("Verification code copied ✅",
-                                       f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}\nAuto-erase in {secure_timeout}s")
+                                notify("Verification code copied ✅", f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}\nAuto-erase in {secure_timeout}s")
                             else:
                                 copy_clipboard(res["code"])
-                                notify("Verification code copied ✅",
-                                       f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}")
+                                notify("Verification code copied ✅", f"{res['code']}  —  {res['subject']}\nFrom: {res['sender']}")
                             log_event(res["sender"], res["subject"], code=res["code"])
                             secure_label = f" 🔒{secure_timeout}s" if secure_timeout > 0 else ""
-                            print(c(f"  [{now_ts}] 📋 Copied {res['code']} from {res['sender']} "
-                                  f"({res['confidence']}%){secure_label}", Style.GREEN), flush=True)
+                            print(c(f"  [{now_ts}] 📋 Copied {res['code']} from {res['sender']} ({res['confidence']}%){secure_label}", Style.GREEN), flush=True)
                         except RuntimeError as e:
                             print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
                             log_event(res["sender"], res["subject"], code=res["code"])
 
-                        seen_codes.add(dedup_key)
+                        seen_codes[dedup_key] = True
                         if len(seen_codes) > 50:
-                            seen_codes = set(list(seen_codes)[-50:])
+                            seen_codes.popitem(last=False)
                             
-                # ── Handle magic link (only if no code was found) ──
                 elif res.get("link"):
                     dedup_key = f"{_sender_domain(res['sender'])}:{_code_hash(res['link'])}"
                     if dedup_key in seen_codes:
@@ -2906,34 +2712,36 @@ def daemon_run(args):
                             print(f"  [{now_ts}] clipboard error: {e}", file=sys.stderr, flush=True)
                             log_event(res["sender"], res["subject"], code=f"LINK:{res['link']}")
 
-                        seen_codes.add(dedup_key)
+                        seen_codes[dedup_key] = True
                         if len(seen_codes) > 50:
-                            seen_codes = set(list(seen_codes)[-50:])
+                            seen_codes.popitem(last=False)
 
-                # ── Handle events ──
-                if res["events"] and have_calendar:
-                    for ev in res["events"]:
-                        ev_key = f"{res['uid']}:{ev['start']}"
-                        if ev_key in seen_events:
-                            continue
-                        if ev["confidence"] >= args.cal_threshold:
-                            link = add_event_to_calendar(ev)
-                            if link:
-                                seen_events.add(ev_key)
-                                log_event(res["sender"], res["subject"], event=ev["title"])
-                                msg = f"📅  {ev['title']} @ {ev['start'][:16]}"
-                                notify("Event added to calendar", msg)
-                                print(c(f"  [{now_ts}] {msg}", Style.CYAN), flush=True)
-                                if len(seen_events) > 50:
-                                    seen_events = set(list(seen_events)[-50:])
+                if res["events"]:
+                    cal_service = get_calendar_service() # Check freshness
+                    if cal_service:
+                        for ev in res["events"]:
+                            ev_key = f"{res['uid']}:{ev['start']}"
+                            if ev_key in seen_events:
+                                continue
+                            if ev["confidence"] >= args.cal_threshold:
+                                link = add_event_to_calendar(ev)
+                                if link:
+                                    seen_events[ev_key] = True
+                                    log_event(res["sender"], res["subject"], event=ev["title"])
+                                    msg = f"📅  {ev['title']} @ {ev['start'][:16]}"
+                                    notify("Event added to calendar", msg)
+                                    print(c(f"  [{now_ts}] {msg}", Style.CYAN), flush=True)
+                                    if len(seen_events) > 50:
+                                        seen_events.popitem(last=False)
+                    else:
+                        print(c("  ⚠  Calendar not authorized or token expired. Run: verify-code auth", Style.YELLOW), flush=True)
 
-                # ── Handle subscriptions ──
                 if args.subscriptions and res.get("body"):
                     sub = extract_subscription(res["body"], res["subject"], res["sender"])
                     if sub:
                         dedup_key = _subscription_key(sub)
                         if dedup_key not in seen_subscriptions:
-                            seen_subscriptions.add(dedup_key)
+                            seen_subscriptions[dedup_key] = True
                             save_subscription(sub)
                             log_event(res["sender"], res["subject"], event=f"sub:{sub['service']}")
                             msg = f"💳  {sub['service']}"
@@ -2948,13 +2756,13 @@ def daemon_run(args):
                             notify("Subscription detected", msg)
                             print(c(f"  [{now_ts}] {msg}", Style.MAGENTA), flush=True)
                             if len(seen_subscriptions) > 50:
-                                seen_subscriptions = set(list(seen_subscriptions)[-50:])
+                                seen_subscriptions.popitem(last=False)
 
                 save_state({
                     "last_uid": last_uid,
-                    "seen_codes": list(seen_codes),
-                    "seen_events": list(seen_events),
-                    "seen_subscriptions": list(seen_subscriptions),
+                    "seen_codes": list(seen_codes.keys()),
+                    "seen_events": list(seen_events.keys()),
+                    "seen_subscriptions": list(seen_subscriptions.keys()),
                     "last_time": datetime.datetime.now().isoformat(),
                 })
 
@@ -2962,11 +2770,10 @@ def daemon_run(args):
                     con.noop()
 
         except (imaplib.IMAP4.error, ssl.SSLError, socket.error, OSError) as e:
-            print(f"  [{datetime.datetime.now():%H:%M:%S}] connection error: {e}; retrying…",
-                  file=sys.stderr, flush=True)
+            print(f"  [{datetime.datetime.now():%H:%M:%S}] connection error: {e}; retrying…", file=sys.stderr, flush=True)
             time.sleep(max(interval, 10))
         except KeyboardInterrupt:
-            print(c("\n  ⏹  Daemon stopped.", Style.YELLOW), flush=True)
+            print(c("\n  🏹  Daemon stopped.", Style.YELLOW), flush=True)
             break
 
 
@@ -2979,8 +2786,8 @@ def scan_mode(args):
     print()
 
     try:
-        res = find_newest_code(con, window, since_uid=0,
-                               known_senders_only=args.known_senders)
+        results = find_newest_code(con, window, since_uid=0,
+                                   known_senders_only=args.known_senders, find_all=True)
     finally:
         try:
             con.close()
@@ -2988,78 +2795,84 @@ def scan_mode(args):
             pass
         con.logout()
 
-    if not res:
+    if not results:
         print("  No emails found in the scan window.")
         return
 
-    if res["code"]:
-        print(c(f"  📋  Code found: {res['code']}", Style.GREEN, Style.BOLD))
-        print(f"     From: {res['sender']}")
-        print(f"     Subject: {res['subject']}")
-        print(f"     Confidence: {res['confidence']}% ({res['method']})")
-        print()
-    elif res.get("link"):
-        print(c(f"  🔗  Magic link found!", Style.GREEN, Style.BOLD))
-        print(f"     From: {res['sender']}")
-        print(f"     Subject: {res['subject']}")
-        print(c(f"     Link: {res['link']}", Style.CYAN))
-        print()
+    if not isinstance(results, list):
+        results = [results]
 
-    if res["events"]:
-        print(c(f"  📅  Events found: {len(res['events'])}", Style.CYAN, Style.BOLD))
-        print()
-        for i, ev in enumerate(res["events"], 1):
-            conf_bar = "█" * (ev["confidence"] // 10) + "░" * (10 - ev["confidence"] // 10)
-            print(f"  {i}. {c(ev['title'], Style.BOLD)}")
-            print(f"     {c('When:', Style.DIM)} {ev['start'][:16]} → {ev['end'][:16]}")
-            if ev.get("location"):
-                print(f"     {c('Where:', Style.DIM)} {ev['location']}")
-            print(f"     {c('Type:', Style.DIM)} {ev['event_type']}  "
-                  f"|  {c('Confidence:', Style.DIM)} {conf_bar} {ev['confidence']}%")
+    found_anything = False
+
+    for res in results:
+        if res.get("code"):
+            found_anything = True
+            print(c(f"  📋  Code found: {res['code']}", Style.GREEN, Style.BOLD))
+            print(f"     From: {res['sender']}")
+            print(f"     Subject: {res['subject']}")
+            print(f"     Confidence: {res['confidence']}% ({res['method']})")
             print()
-    else:
+        elif res.get("link"):
+            found_anything = True
+            print(c(f"  🔗  Magic link found!", Style.GREEN, Style.BOLD))
+            print(f"     From: {res['sender']}")
+            print(f"     Subject: {res['subject']}")
+            print(c(f"     Link: {res['link']}", Style.CYAN))
+            print()
+
+        if res["events"]:
+            found_anything = True
+            print(c(f"  📅  Events found: {len(res['events'])}", Style.CYAN, Style.BOLD))
+            print()
+            for i, ev in enumerate(res["events"], 1):
+                conf_bar = "█" * (ev["confidence"] // 10) + "░" * (10 - ev["confidence"] // 10)
+                print(f"  {i}. {c(ev['title'], Style.BOLD)}")
+                print(f"     {c('When:', Style.DIM)} {ev['start'][:16]} → {ev['end'][:16]}")
+                if ev.get("location"):
+                    print(f"     {c('Where:', Style.DIM)} {ev['location']}")
+                print(f"     {c('Type:', Style.DIM)} {ev['event_type']}  |  {c('Confidence:', Style.DIM)} {conf_bar} {ev['confidence']}%")
+                print()
+
+        if args.subscriptions and res.get("body"):
+            sub = extract_subscription(res["body"], res["subject"], res["sender"])
+            if sub:
+                found_anything = True
+                print(c("  💳  Subscription detected:", Style.MAGENTA, Style.BOLD))
+                print()
+                print(f"     {format_subscription(sub)}")
+                print()
+                save_subscription(sub)
+                print(c("  ✅  Subscription saved to tracker.", Style.GREEN))
+                print(c("  Run: verify-code subscriptions  (to view all tracked)", Style.DIM))
+                print()
+
+    if not found_anything:
         print("  No events with dates/times found.")
         print("  Tip: Try --minutes 60 to scan a wider window.")
         print()
-
-    if args.subscriptions and res["body"]:
-        sub = extract_subscription(res["body"], res["subject"], res["sender"])
-        if sub:
-            print(c("  💳  Subscription detected:", Style.MAGENTA, Style.BOLD))
-            print()
-            print(f"     {format_subscription(sub)}")
-            print()
-            save_subscription(sub)
-            print(c("  ✅  Subscription saved to tracker.", Style.GREEN))
-            print(c("  Run: verify-code subscriptions  (to view all tracked)", Style.DIM))
-            print()
-        else:
-            print("  💳  No subscription info detected in this email.")
-            print()
 
 
 def install_service(args):
     """Install: download latest, copy to PATH, set up auto-start, run setup wizard."""
     if IS_WINDOWS:
-        local_bin = os.path.expanduser("~\\AppData\\Local\\Programs")
+        local_bin = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Programs", "verify-code")
+        local_script = os.path.join(local_bin, "verify-code.py")
     else:
         local_bin = os.path.expanduser("~/.local/bin")
-    local_script = os.path.join(local_bin, "verify-code")
-    if IS_WINDOWS:
-        local_script += ".py"
+        local_script = os.path.join(local_bin, "verify-code")
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
     print(c("  ║   Installing the latest version…         ║", Style.CYAN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
     version_str = download_latest()
     if version_str is None:
         return
 
-    if local_bin not in os.environ.get("PATH", ""):
+    if not is_path_in_env(local_bin):
         if IS_WINDOWS:
             print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
             print(f"     setx PATH \"%PATH%;{local_bin}\"")
@@ -3109,7 +2922,7 @@ WantedBy=default.target
 
         print(c(f"  ✅  Installed: {SERVICE_FILE}", Style.GREEN, Style.BOLD))
     elif IS_WINDOWS:
-        print(c("  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
+        print(c(f"  ✅  Installed to {local_script}", Style.GREEN, Style.BOLD))
         print(c("  ⚡  On Windows, add to Task Scheduler or startup folder for auto-start.", Style.YELLOW))
 
     ans = input(c("  🚀  Run the setup wizard now (configure Gmail + Calendar)? (Y/n): ", Style.BOLD)).strip().lower()
@@ -3130,10 +2943,8 @@ WantedBy=default.target
                 print()
             else:
                 print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
-                subprocess.run(["systemctl", "--user", "daemon-reload"],
-                               capture_output=True, timeout=10)
-                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
-                               capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"], capture_output=True, timeout=10)
                 print(c(" ✅", Style.GREEN))
                 print()
                 print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
@@ -3142,9 +2953,9 @@ WantedBy=default.target
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print("  Quick commands:")
     print("    verify-code                  # One-shot: copy latest code/link")
@@ -3163,13 +2974,13 @@ WantedBy=default.target
 def uninstall():
     """Remove verify-code: script, credentials, state, service, calendar token."""
     print_banner()
-    print(c("  ╔══════════════════════════════════════════╗", Style.RED, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.RED, Style.BOLD))
     print(c("  ║   ⚠  Uninstalling verify-code  ⚠        ║", Style.RED, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.RED, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.RED, Style.BOLD))
     print()
     print(c("  This will remove:", Style.BOLD))
     if IS_WINDOWS:
-        print(f"  •  Script:          {CONFIG_DIR}\\verify-code.py")
+        print(f"  •  Script:          {os.path.join(os.environ.get('LOCALAPPDATA', '~'), 'Programs', 'verify-code', 'verify-code.py')}")
     else:
         print(f"  •  Script:          ~/.local/bin/verify-code")
     print(f"  •  Config:          {CONFIG_DIR}")
@@ -3188,17 +2999,15 @@ def uninstall():
 
     if not IS_WINDOWS and SERVICE_FILE and os.path.exists(SERVICE_FILE):
         try:
-            subprocess.run(["systemctl", "--user", "stop", "verify-code"],
-                           capture_output=True, timeout=10)
-            subprocess.run(["systemctl", "--user", "disable", "verify-code"],
-                           capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "stop", "verify-code"], capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "disable", "verify-code"], capture_output=True, timeout=10)
             os.remove(SERVICE_FILE)
             removed.append(SERVICE_FILE)
         except Exception as e:
             errors.append(f"systemd: {e}")
 
     if IS_WINDOWS:
-        local_script = os.path.join(CONFIG_DIR, "verify-code.py")
+        local_script = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Programs", "verify-code", "verify-code.py")
     else:
         local_script = os.path.expanduser("~/.local/bin/verify-code")
     if os.path.exists(local_script):
@@ -3250,7 +3059,7 @@ def uninstall():
 def download_latest():
     """Download the latest verify-code from GitHub to the install path."""
     if IS_WINDOWS:
-        local_bin = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code")
+        local_bin = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Programs", "verify-code")
         local_script = os.path.join(local_bin, "verify-code.py")
     else:
         local_bin = os.path.expanduser("~/.local/bin")
@@ -3286,10 +3095,11 @@ def download_latest():
 
     version_str = "?"
     try:
-        for line in open(local_script):
-            if line.startswith("__version__"):
-                version_str = line.split('"')[1]
-                break
+        with open(local_script) as f:
+            for line in f:
+                if line.startswith("__version__"):
+                    version_str = line.split('"')[1]
+                    break
     except Exception:
         pass
 
@@ -3304,10 +3114,10 @@ def self_install(script_path=None):
     local_bin = os.path.expanduser("~/.local/bin")
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   🔐  verify-code                       ║", Style.CYAN, Style.BOLD))
     print(c("  ║   Installing the latest version…         ║", Style.CYAN))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
     version_str = download_latest()
@@ -3315,12 +3125,12 @@ def self_install(script_path=None):
         return
 
     if IS_WINDOWS:
-        local_bin = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code")
+        local_bin = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Programs", "verify-code")
         local_script = os.path.join(local_bin, "verify-code.py")
     else:
         local_script = os.path.join(local_bin, "verify-code")
 
-    if local_bin not in os.environ.get("PATH", ""):
+    if not is_path_in_env(local_bin):
         if IS_WINDOWS:
             print(c(f"  ⚠  Add {local_bin} to your PATH:", Style.YELLOW))
             print(f"     setx PATH \"%PATH%;{local_bin}\"")
@@ -3352,10 +3162,8 @@ def self_install(script_path=None):
                 print(c("  ⚡  On Windows, add to Task Scheduler for auto-start.", Style.YELLOW))
             else:
                 print(c("  Enabling and starting…", Style.DIM), end="", flush=True)
-                subprocess.run(["systemctl", "--user", "daemon-reload"],
-                               capture_output=True, timeout=10)
-                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"],
-                               capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=10)
+                subprocess.run(["systemctl", "--user", "enable", "--now", "verify-code"], capture_output=True, timeout=10)
                 print(c(" ✅", Style.GREEN))
                 print()
                 print(c("  ✅  Daemon is running! Auto-starts on login.", Style.GREEN, Style.BOLD))
@@ -3364,9 +3172,9 @@ def self_install(script_path=None):
             print(c("  ⚠  Run setup first, then install again for the daemon.", Style.YELLOW))
 
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║  🎉  verify-code is ready!              ║", Style.GREEN, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.GREEN, Style.BOLD))
     print()
     print("  Quick commands:")
     print("    verify-code              — copy latest code/link")
@@ -3380,9 +3188,9 @@ def self_install(script_path=None):
 def update_self():
     """Update verify-code to the latest version from GitHub."""
     print()
-    print(c("  ╔══════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
+    print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
     print(c("  ║   🔄  Checking for updates…              ║", Style.CYAN, Style.BOLD))
-    print(c("  ╚══════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
+    print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
 
     if not _which("curl") and not IS_WINDOWS:
@@ -3395,7 +3203,7 @@ def update_self():
     cache_buster = f"?v={int(time.time())}"
     url = "https://raw.githubusercontent.com/aakashjabraham-hue/verify-code/main/verify-code" + cache_buster
     if IS_WINDOWS:
-        local_script = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "verify-code", "verify-code.py")
+        local_script = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Programs", "verify-code", "verify-code.py")
         local_bin = os.path.dirname(local_script)
     else:
         local_script = os.path.expanduser("~/.local/bin/verify-code")
@@ -3420,28 +3228,42 @@ def update_self():
             print(c("  ✗  Download failed (curl error)", Style.RED))
             print()
             for p in [tmp_script]:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+                try: os.remove(p)
+                except Exception: pass
             return
 
         remote_version = "?"
         try:
-            for line in open(tmp_script):
-                if line.startswith("__version__"):
-                    remote_version = line.split('"')[1]
-                    break
+            with open(tmp_script) as f:
+                for line in f:
+                    if line.startswith("__version__"):
+                        remote_version = line.split('"')[1]
+                        break
         except Exception:
             pass
 
-        if remote_version == current_version or remote_version == "?":
-            os.remove(tmp_script)
+        if remote_version == current_version:
+            try: os.remove(tmp_script)
+            except Exception: pass
             print(c(f"  ✅  You're already on the latest version ({current_version})!", Style.GREEN, Style.BOLD))
             print()
             return
+        
+        if remote_version == "?":
+            try: os.remove(tmp_script)
+            except Exception: pass
+            print(c("  ✗  Could not determine remote version. Update aborted.", Style.RED))
+            print()
+            return
 
-        os.replace(tmp_script, local_script)
+        try:
+            os.replace(tmp_script, local_script)
+        except PermissionError:
+            print(c("  ✗  Permission denied. Is the script currently running?", Style.RED))
+            try: os.remove(tmp_script)
+            except Exception: pass
+            return
+
         _chmod_755(local_script)
         print(c(f"  ✅  Updated from {current_version} → {remote_version}!", Style.GREEN, Style.BOLD))
         print(f"  Saved to: {local_script}")
@@ -3452,23 +3274,19 @@ def update_self():
         print(c(" ✗", Style.RED))
         print(c("  ✗  Download timed out. Check your internet connection.", Style.RED))
         for p in [tmp_script]:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+            try: os.remove(p)
+            except Exception: pass
     except Exception as e:
         print(c(" ✗", Style.RED))
         print(c(f"  ✗  Update failed: {e}", Style.RED))
         for p in [tmp_script]:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+            try: os.remove(p)
+            except Exception: pass
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(
@@ -3535,6 +3353,8 @@ One-liner install (Windows PowerShell):
     if args.cmd == "setup":
         setup()
     elif args.cmd == "daemon":
+        if not args.subscriptions:
+            args.subscriptions = True # Default for daemon, but can be toggled if explicitly disabled? The original forced it.
         daemon_run(args)
     elif args.cmd == "install":
         if sys.argv[0] in ("-", "/dev/stdin"):
