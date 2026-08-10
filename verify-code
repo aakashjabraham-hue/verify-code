@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-verify-code v2.4.2 — grab codes, magic links, find events, track subscriptions, add to calendar.
+verify-code v2.5.0 — grab codes, magic links, find events, track subscriptions, add to calendar, fill forms.
 
 Modes:
-  verify-code setup            Interactive wizard: credentials + Google Calendar OAuth.
+  verify-code setup            Interactive wizard: credentials + Google Calendar OAuth + Form Filler.
   verify-code                  One-shot: copy newest verification code/link from last 10 min.
-  verify-code daemon           Background: watch inbox, auto-copy codes/links, extract events.
+  verify-code daemon           Background: watch inbox, auto-copy codes/links, extract events, hotkeys.
+  verify-code fill             Sequentially type your saved form data (click first field, wait 3s).
   verify-code install          Install auto-start service for login.
   verify-code scan             Scan inbox for events with dates/times (no code copy).
   verify-code subscriptions    View all tracked subscriptions with warnings and spending totals.
@@ -29,6 +30,7 @@ Features:
   - Atomic state writes with CRC validation.
   - Credentials in ~/.config/verify-code/ (chmod 600).
   - OAuth token stored alongside credentials.
+  - Form Filler: OS Keyring encryption + global hotkey auto-typing.
 """
 
 from __future__ import annotations
@@ -77,7 +79,16 @@ try:
 except ImportError:
     DATEUTIL_AVAILABLE = False
 
-__version__ = "2.4.2"
+# ── Form Filler imports (optional) ────────────────────────────────────────────
+try:
+    import keyring
+    from cryptography.fernet import Fernet
+    import keyboard
+    FORM_FILLER_AVAILABLE = True
+except ImportError:
+    FORM_FILLER_AVAILABLE = False
+
+__version__ = "2.5.1"
 
 # ── Platform detection ────────────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -95,17 +106,14 @@ def _which(name):
         return False
 
 def _chmod_600(path):
-    """Set restrictive permissions on a file. No-op on Windows."""
     if not IS_WINDOWS:
         os.chmod(path, 0o600)
 
 def _chmod_644(path):
-    """Set readable permissions on a file. No-op on Windows."""
     if not IS_WINDOWS:
         os.chmod(path, 0o644)
 
 def _chmod_755(path):
-    """Set executable permissions on a file. No-op on Windows."""
     if not IS_WINDOWS:
         os.chmod(path, 0o755)
 
@@ -115,21 +123,25 @@ if IS_WINDOWS:
     local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
     CONFIG_DIR = os.path.join(appdata, "verify-code")
     STATE_DIR = os.path.join(appdata, "verify-code", "data")
-    SERVICE_FILE = None  # no systemd on Windows
+    SERVICE_FILE = None
 elif IS_MACOS:
     CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
     STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
-    SERVICE_FILE = None  # no launchd integration yet
+    SERVICE_FILE = None
 else:
     CONFIG_DIR = os.path.expanduser("~/.config/verify-code")
     STATE_DIR = os.path.expanduser("~/.local/share/verify-code")
     SERVICE_FILE = os.path.expanduser("~/.config/systemd/user/verify-code.service")
+
 CRED_FILE = os.path.join(CONFIG_DIR, "credentials.json")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "log.txt")
 SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 CAL_TOKEN_FILE = os.path.join(CONFIG_DIR, "calendar_token.json")
 CAL_CLIENT_FILE = os.path.join(CONFIG_DIR, "calendar_client.json")
+FORM_DATA_FILE = os.path.join(CONFIG_DIR, "form_data.enc")
+KEYRING_SERVICE = "verify-code"
+KEYRING_USER = "form-filler-key"
 
 # ── IMAP Providers ────────────────────────────────────────────────────────────
 IMAP_PROVIDERS = {
@@ -159,7 +171,7 @@ def c(text, *styles):
 def print_banner():
     print()
     print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
-    print(c("  ║         🔐  verify-code  v2.4  🔐        ║", Style.CYAN, Style.BOLD))
+    print(c("  ║         🔐  verify-code  v2.5  🔐        ║", Style.CYAN, Style.BOLD))
     print(c("  ║    Auto-copy codes · Find events · 💳 Sub  ║", Style.CYAN))
     print(c("  ╚══════════════════════════════════════════════════════════╝", Style.CYAN, Style.BOLD))
     print()
@@ -301,26 +313,16 @@ RE_TIME = re.compile(
     r"(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?))?",
     re.I,
 )
-RE_DATE_ISO = re.compile(
-    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})"
-)
-RE_DATE_US = re.compile(
-    r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
-)
+RE_DATE_ISO = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
+RE_DATE_US = re.compile(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})")
 
 EVENT_KEYWORDS = {
-    "flight": ["flight", "departure", "boarding", "gate", "airline", "airport", "terminal",
-               "seat", "confirmation", "itinerary", "e-ticket", "eticket"],
-    "appointment": ["appointment", "doctor", "dentist", "checkup", "consultation",
-                    "scheduled", "visit", "procedure"],
-    "meeting": ["meeting", "conference", "call", "video call", "zoom", "teams",
-                "standup", "sync", "review", "interview"],
-    "reservation": ["reservation", "booking", "dinner", "lunch", "breakfast", "table",
-                    "restaurant", "hotel", "check-in", "checkout", "stay"],
-    "event": ["event", "ticket", "concert", "show", "movie", "performance",
-              "game", "match", "tournament", "festival", "workshop", "webinar"],
-    "delivery": ["delivery", "package", "shipped", "arriving", "on its way",
-                 "estimated", "tracking"],
+    "flight": ["flight", "departure", "boarding", "gate", "airline", "airport", "terminal", "seat", "confirmation", "itinerary", "e-ticket", "eticket"],
+    "appointment": ["appointment", "doctor", "dentist", "checkup", "consultation", "scheduled", "visit", "procedure"],
+    "meeting": ["meeting", "conference", "call", "video call", "zoom", "teams", "standup", "sync", "review", "interview"],
+    "reservation": ["reservation", "booking", "dinner", "lunch", "breakfast", "table", "restaurant", "hotel", "check-in", "checkout", "stay"],
+    "event": ["event", "ticket", "concert", "show", "movie", "performance", "game", "match", "tournament", "festival", "workshop", "webinar"],
+    "delivery": ["delivery", "package", "shipped", "arriving", "on its way", "estimated", "tracking"],
 }
 
 # ── Global state for secure clipboard ─────────────────────────────────────────
@@ -339,7 +341,6 @@ def load_creds():
         sys.exit(c("No credentials found. Run: verify-code setup", Style.RED, Style.BOLD))
     with open(CRED_FILE) as f:
         return json.load(f)
-
 
 def save_creds(email_addr, password, host=DEFAULT_IMAP[0], port=DEFAULT_IMAP[1],
                cal_token=None, cal_client=None, provider=None, secure=False, secure_timeout=30):
@@ -363,11 +364,123 @@ def save_creds(email_addr, password, host=DEFAULT_IMAP[0], port=DEFAULT_IMAP[1],
             json.dump(cal_client, f, indent=2)
         _chmod_600(CAL_CLIENT_FILE)
 
+# ── Form Filler Encryption ────────────────────────────────────────────────────
+
+def _get_fernet() -> Fernet | None:
+    if not FORM_FILLER_AVAILABLE:
+        return None
+    key = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+    if not key:
+        key = Fernet.generate_key().decode()
+        keyring.set_password(KEYRING_SERVICE, KEYRING_USER, key)
+    return Fernet(key.encode())
+
+def save_form_data(data: dict):
+    f = _get_fernet()
+    if not f:
+        print(c("  ✗  Form filler dependencies missing. Install with: pip install keyring cryptography", Style.RED))
+        return False
+    raw = json.dumps(data).encode()
+    enc = f.encrypt(raw)
+    with open(FORM_DATA_FILE, "wb") as file:
+        file.write(enc)
+    _chmod_600(FORM_DATA_FILE)
+    return True
+
+def load_form_data() -> dict:
+    if not os.path.exists(FORM_DATA_FILE):
+        return {}
+    f = _get_fernet()
+    if not f:
+        return {}
+    try:
+        with open(FORM_DATA_FILE, "rb") as file:
+            enc = file.read()
+        raw = f.decrypt(enc)
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+def setup_form_filler():
+    if not FORM_FILLER_AVAILABLE:
+        print(c("  ⚠  Form filler dependencies missing. Install with:", Style.YELLOW))
+        print("     pip install keyring cryptography keyboard")
+        return False
+
+    print(c("  ── Form Filler Setup ──", Style.CYAN, Style.BOLD))
+    print("  Enter your details. They will be encrypted and stored securely.")
+    print()
+    form_data = load_form_data()
+    
+    def prompt(key, label, secret=False):
+        current = form_data.get(key, "")
+        prompt_text = f"  {label}"
+        if current:
+            prompt_text += f" [current: {'*' * len(current) if secret else current}]"
+        prompt_text += ": "
+        val = getpass.getpass(c(prompt_text, Style.BOLD)) if secret else input(c(prompt_text, Style.BOLD)).strip()
+        return val if val else current
+
+    form_data["first_name"] = prompt("first_name", "First Name")
+    form_data["last_name"] = prompt("last_name", "Last Name")
+    form_data["email"] = prompt("email", "Email")
+    form_data["phone"] = prompt("phone", "Phone Number")
+    form_data["address1"] = prompt("address1", "Address Line 1")
+    form_data["address2"] = prompt("address2", "Address Line 2 (optional)")
+    form_data["city"] = prompt("city", "City")
+    form_data["state"] = prompt("state", "State/Province")
+    form_data["zip"] = prompt("zip", "ZIP/Postal Code")
+    form_data["country"] = prompt("country", "Country")
+    
+    print()
+    print(c("  💳  Payment Information", Style.MAGENTA, Style.BOLD))
+    form_data["cc_number"] = prompt("cc_number", "Credit Card Number", secret=True)
+    form_data["cc_exp"] = prompt("cc_exp", "Expiration (MM/YY)", secret=True)
+    form_data["cc_cvv"] = prompt("cc_cvv", "CVV", secret=True)
+
+    if save_form_data(form_data):
+        print(c("  ✅  Form data encrypted and saved!", Style.GREEN, Style.BOLD))
+        return True
+    return False
+
+def trigger_form_fill():
+    data = load_form_data()
+    if not data:
+        print(c("  ✗  No form data saved. Run: verify-code setup", Style.RED))
+        return
+    
+    print(c("  ⌨️  Starting form fill in 3 seconds... Click the first input field!", Style.YELLOW, Style.BOLD))
+    time.sleep(3)
+    
+    fields = [
+        data.get("first_name", ""),
+        data.get("last_name", ""),
+        data.get("email", ""),
+        data.get("phone", ""),
+        data.get("address1", ""),
+        data.get("address2", ""),
+        data.get("city", ""),
+        data.get("state", ""),
+        data.get("zip", ""),
+        data.get("country", ""),
+        data.get("cc_number", ""),
+        data.get("cc_exp", ""),
+        data.get("cc_cvv", "")
+    ]
+    
+    for field in fields:
+        if field:
+            keyboard.write(field)
+        keyboard.send('tab')
+        time.sleep(0.1)
+        
+    print(c("  ✅  Form fill complete!", Style.GREEN))
+
+# ── State / Subscriptions / Logging ───────────────────────────────────────────
 
 def _compute_crc(data: dict) -> str:
     raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()[:12]
-
 
 def load_state():
     default = {"last_uid": 0, "seen_codes": [], "seen_events": [], "seen_subscriptions": [], "last_time": None}
@@ -392,7 +505,6 @@ def load_state():
         data["seen_events"] = []
     return data
 
-
 def save_state(state):
     os.makedirs(STATE_DIR, exist_ok=True)
     payload = {k: v for k, v in state.items()
@@ -405,7 +517,6 @@ def save_state(state):
         os.fsync(f.fileno())
     os.replace(tmp, STATE_FILE)
     _chmod_600(STATE_FILE)
-
 
 def log_event(sender, subject, code=None, event=None):
     try:
@@ -424,7 +535,6 @@ def log_event(sender, subject, code=None, event=None):
     except Exception:
         pass
 
-
 def _subscription_key(sub: dict) -> str:
     service = sub.get("service", "unknown")
     plan = sub.get("plan", "")
@@ -432,14 +542,12 @@ def _subscription_key(sub: dict) -> str:
     cycle = sub.get("billing_cycle", "")
     return f"{service}:{plan}:{amount}:{cycle}"
 
-
 def load_subscriptions() -> list[dict]:
     try:
         with open(SUBSCRIPTIONS_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
-
 
 def save_subscription(sub: dict):
     subs = load_subscriptions()
@@ -471,7 +579,6 @@ def save_subscription(sub: dict):
     except Exception:
         pass
 
-
 def notify(title, body):
     if IS_WINDOWS:
         try:
@@ -502,6 +609,7 @@ def notify(title, body):
         except Exception:
             pass
 
+# ── Clipboard Helpers ─────────────────────────────────────────────────────────
 
 def copy_clipboard(text):
     text = text.strip()
@@ -535,7 +643,6 @@ def copy_clipboard(text):
             continue
     raise RuntimeError("No clipboard tool worked (install wl-clipboard for Wayland, xclip for X11, or use Windows).")
 
-
 def erase_clipboard():
     for cmd in [["powershell", "-Command", "$input | Set-Clipboard"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]]:
         try:
@@ -550,9 +657,7 @@ def erase_clipboard():
         except (subprocess.TimeoutExpired, OSError):
             continue
 
-
 def secure_copy_clipboard(text, timeout=30):
-    """Copy code/link to clipboard and schedule auto-erase after `timeout` seconds."""
     global _CLIPBOARD_GEN
     backend = copy_clipboard(text)
     if timeout > 0:
@@ -569,9 +674,7 @@ def secure_copy_clipboard(text, timeout=30):
         atexit.register(erase_clipboard)
     return backend
 
-
 def get_email_bodies(msg):
-    """Extract plain text and raw HTML from email, with proper charset handling."""
     if msg.is_multipart():
         plain = html_body = None
         for part in msg.walk():
@@ -612,21 +715,18 @@ def get_email_bodies(msg):
             decoded = body.decode(charset, errors="replace")
         except LookupError:
             decoded = body.decode("utf-8", errors="replace")
-            
         if msg.get_content_type() == "text/html":
             return html_to_text(decoded), decoded
         return decoded, None
     except Exception:
         return str(msg), None
 
-
 def html_to_text(html_str):
     text = html_str
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
-    text = re.sub(r"</?(?:div|p|br|tr|li|h[1-6]|blockquote|section|article|header|footer)[^>]*>",
-                  "\n", text, flags=re.I)
+    text = re.sub(r"</?(?:div|p|br|tr|li|h[1-6]|blockquote|section|article|header|footer)[^>]*>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
     text = re.sub(r"\n\s*\n", "\n", text)
@@ -644,39 +744,29 @@ RE_LINK_BLACKLIST = re.compile(
 )
 
 def extract_magic_link(html_str, subject="", sender=""):
-    """Find a verification/magic link in HTML email."""
     if not html_str:
         return None
-        
     known_sender = is_known_sender(sender)
-    
     for m in RE_A_TAG.finditer(html_str):
         url = html.unescape(m.group("url").strip())
         text = re.sub(r'<[^>]+>', '', m.group("text")).strip()
-        
         if not url.startswith("http"):
             continue
-            
         has_context = bool(CONTEXT_WORDS.search(text) or CONTEXT_WORDS.search(url))
         is_blacklisted = bool(RE_LINK_BLACKLIST.search(text) or RE_LINK_BLACKLIST.search(url))
-        
         if has_context and not is_blacklisted:
             if not known_sender:
                 if not re.search(r"(?:verify|confirm|magic|authenticat|sign[\s-]?in|log[\s-]?in)", text, re.I):
                     continue
             return url
-            
     return None
-
 
 def _sender_domain(sender: str) -> str:
     m = re.search(r"@([^>\s]+)", sender)
     return m.group(1).lower().lstrip(".") if m else sender.lower()
 
-
 def _code_hash(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()[:16]
-
 
 def is_known_sender(sender: str) -> bool:
     domain = _sender_domain(sender)
@@ -689,9 +779,8 @@ def is_known_sender(sender: str) -> bool:
             return True
     return False
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# Code Extraction
+# Code / Event / Subscription Extraction
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_code(text, subject="", sender=""):
@@ -733,18 +822,11 @@ def extract_code(text, subject="", sender=""):
             nearby = text[max(0, idx - 80):idx + len(code) + 80]
             if CONTEXT_WORDS.search(nearby):
                 return {"code": code, "confidence": 55, "method": "short_4_digit"}
-
     return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Date/Time + Event Extraction
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_datetime(text, subject="", sender=""):
     events = []
     body = text[:5000]
-
     if not DATEUTIL_AVAILABLE:
         return events
 
@@ -759,10 +841,7 @@ def extract_datetime(text, subject="", sender=""):
         event_type = max(type_scores, key=type_scores.get)
 
     title = subject.strip()
-    title_clean = re.sub(
-        r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New:?\s*)+",
-        "", title, flags=re.I
-    ).strip(" :,;-\"'")
+    title_clean = re.sub(r"^(?:Re:|Fwd?|Confirmed|Reminder|Your|Upcoming|Scheduled|New:?\s*)+", "", title, flags=re.I).strip(" :,;-\"'")
     if not title_clean:
         title_clean = event_type.capitalize()
 
@@ -785,9 +864,7 @@ def extract_datetime(text, subject="", sender=""):
     for m in RE_DATE_FULL.finditer(body):
         date_str = m.group(1)
         time_str = m.group(2) if m.lastindex >= 2 and m.group(2) else None
-        full_str = date_str
-        if time_str:
-            full_str += " " + time_str
+        full_str = date_str + (" " + time_str if time_str else "")
         full_str = full_str.rstrip(".,;:!?")
         try:
             dt = dateparser.parse(full_str, fuzzy=True, default=now)
@@ -800,9 +877,7 @@ def extract_datetime(text, subject="", sender=""):
     for m in RE_DATE_MONTH_DAY.finditer(body):
         date_str = m.group(1)
         time_str = m.group(2) if m.lastindex >= 2 and m.group(2) else None
-        full_str = date_str
-        if time_str:
-            full_str += " " + time_str
+        full_str = date_str + (" " + time_str if time_str else "")
         full_str = full_str.rstrip(".,;:!?")
         try:
             dt = dateparser.parse(full_str, fuzzy=True, default=now)
@@ -872,11 +947,7 @@ def extract_datetime(text, subject="", sender=""):
                 time_text = body[max(0, pos - 20):pos + len(match_str) + 120]
             else:
                 time_text = body
-            
-            range_m = re.search(
-                r"(?:to|-|–|until)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)",
-                time_text, re.I
-            )
+            range_m = re.search(r"(?:to|-|–|until)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?|AM|PM|am|pm)?)", time_text, re.I)
             if range_m:
                 try:
                     end_str = dt.strftime("%Y-%m-%d") + " " + range_m.group(1)
@@ -902,154 +973,7 @@ def extract_datetime(text, subject="", sender=""):
 
     return events
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Subscription Tracking
-# ═══════════════════════════════════════════════════════════════════════════════
-
-SUBSCRIPTION_SENDERS = {
-    "netflix.com": "Netflix", "mailer.netflix.com": "Netflix",
-    "spotify.com": "Spotify", "message.spotify.com": "Spotify",
-    "apple.com": "Apple", "appleid.apple.com": "Apple",
-    "icloud.com": "iCloud",
-    "disneyplus.com": "Disney+", "disneyaccount.com": "Disney+",
-    "hbomax.com": "HBO Max", "warnermedia.com": "HBO Max",
-    "hulu.com": "Hulu", "account.hulu.com": "Hulu",
-    "paramountplus.com": "Paramount+", "peacocktv.com": "Peacock",
-    "youtube.com": "YouTube Premium", "youtubemusic.com": "YouTube Music",
-    "adobe.com": "Adobe", "accounts.adobe.com": "Adobe",
-    "microsoft.com": "Microsoft 365", "account.microsoft.com": "Microsoft 365",
-    "notion.com": "Notion", "notion.so": "Notion",
-    "slack.com": "Slack",
-    "linear.app": "Linear",
-    "figma.com": "Figma",
-    "canva.com": "Canva Pro",
-    "zoom.us": "Zoom",
-    "aws.amazon.com": "AWS", "amazonaws.com": "AWS",
-    "digitalocean.com": "DigitalOcean",
-    "vercel.com": "Vercel",
-    "netlify.com": "Netlify",
-    "heroku.com": "Heroku",
-    "github.com": "GitHub", "notifications.github.com": "GitHub",
-    "gitlab.com": "GitLab",
-    "datadoghq.com": "Datadog",
-    "dropbox.com": "Dropbox",
-    "google.com": "Google One", "accounts.google.com": "Google",
-    "mongodb.com": "MongoDB Atlas",
-    "supabase.com": "Supabase",
-    "tailscale.com": "Tailscale",
-    "1password.com": "1Password",
-    "lastpass.com": "LastPass",
-    "bitwarden.com": "Bitwarden",
-    "todoist.com": "Todoist",
-    "evernote.com": "Evernote",
-    "medium.com": "Medium",
-    "patreon.com": "Patreon",
-    "onlyfans.com": "OnlyFans",
-    "substack.com": "Substack",
-    "ghost.org": "Ghost",
-    "wordpress.com": "WordPress.com",
-    "wix.com": "Wix",
-    "mailchimp.com": "Mailchimp",
-    "shopify.com": "Shopify",
-    "stripe.com": "Stripe",
-    "replit.com": "Replit",
-    "railway.app": "Railway",
-    "fly.io": "Fly.io",
-    "render.com": "Render",
-    "namecheap.com": "Namecheap",
-    "godaddy.com": "GoDaddy",
-    "cloudflare.com": "Cloudflare",
-    "atlassian.com": "Atlassian",
-    "trello.com": "Trello",
-    "jira.com": "Jira",
-    "discord.com": "Discord Nitro",
-    "telegram.org": "Telegram Premium",
-    "x.com": "X Premium",
-    "twitter.com": "X Premium",
-    "tidal.com": "Tidal",
-    "deezer.com": "Deezer",
-    "pandora.com": "Pandora",
-    "soundcloud.com": "SoundCloud",
-    "crunchyroll.com": "Crunchyroll",
-    "funimation.com": "Funimation",
-    "newyorktimes.com": "NYTimes",
-    "nytimes.com": "NYTimes",
-    "wsj.com": "WSJ",
-    "washingtonpost.com": "Washington Post",
-    "theatlantic.com": "The Atlantic",
-    "economist.com": "The Economist",
-    "nintendo.com": "Nintendo Switch", 
-    "playstation.com": "PlayStation Plus",
-    "xbox.com": "Xbox Game Pass",
-    "roblox.com": "Roblox Premium",
-    "epicgames.com": "Epic Games",
-    "steampowered.com": "Steam",
-    "blizzard.com": "Blizzard",
-    "ea.com": "EA Play",
-    "ubisoft.com": "Ubisoft+",
-}
-
-# Subscription keywords in email subject/body
-SUBSCRIPTION_KEYWORDS = re.compile(
-    r"(?:subscription|subscribed|subscribing|renewal|renewed|renewing|renew|"
-    r"trial|free trial|trial period|trial ends|trial ending|"
-    r"billing|bill|invoice|receipt|payment|charged|charge|"
-    r"upgrade|downgrade|plan change|cancel|cancelled|cancellation|"
-    r"automatic payment|auto-renew|auto[- ]?renew|"
-    r"your plan|your membership|your account|"
-    r"next payment|payment due|due date|"
-    r"thank you for your (?:purchase|order|payment))",
-    re.I,
-)
-
-# Regex to extract dollar amounts
-RE_AMOUNT = re.compile(r"\$(\d{1,6}(?:[.,]\d{2})?)")
-
-# Regex to extract billing cycles
-RE_BILLING_CYCLE = re.compile(
-    r"(?:billed|billing|charge|charged|renews|renewal|every|each|per|[/])\s*"
-    r"(monthly|month|yearly|annual|year|weekly|week|quarterly|quarter)",
-    re.I,
-)
-
-# Regex to extract plan names
-RE_PLAN_NAME = re.compile(
-    r"(?:plan|tier|level|package|subscription)\s*:?\s*"
-    r"([A-Za-z0-9][A-Za-z0-9\s.'\-+]{1,20}?)(?:\s*\$|\s*[.!,]|\s*$|"
-    r"\s+(?:plan|subscription|tier|level)\b)",
-    re.I,
-)
-
-# Regex to find dates near subscription keywords
-RE_SUB_DATE = re.compile(
-    r"(?:on|by|before|after|for|date:)?\s*"
-    r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?)",
-    re.I,
-)
-
-# Simple date like "2026-08-20" or "8/20/2026" near sub keywords
-RE_SUB_DATE_ISO = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})")
-RE_SUB_DATE_US = re.compile(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})")
-
-
-def _lookup_service_name(sender: str) -> str | None:
-    """Look up the friendly service name from a sender email domain."""
-    domain = _sender_domain(sender)
-    if domain in SUBSCRIPTION_SENDERS:
-        return SUBSCRIPTION_SENDERS[domain]
-    parts = domain.split(".")
-    for i in range(len(parts) - 1):
-        candidate = ".".join(parts[i:])
-        if candidate in SUBSCRIPTION_SENDERS:
-            return SUBSCRIPTION_SENDERS[candidate]
-    return None
-
-
 def extract_subscription(text, subject="", sender="") -> dict | None:
-    """Extract subscription info from an email body."""
     body = text[:5000]
     combined = f"{subject} {sender} {body}"
 
@@ -1058,14 +982,12 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     service_name = _lookup_service_name(sender)
     known_sender = service_name is not None
-
     body_lower = body.lower() + " " + subject.lower()
 
     status = "active"
     if re.search(r"(?:trial|free trial|trial period|trial ends|trial ending)", combined, re.I):
         status = "trial"
-    if re.search(r"(?:cancelled|canceled|cancelling|canceling|cancellation|"
-                 r"cancel your|you cancelled|has been cancelled)", combined, re.I):
+    if re.search(r"(?:cancelled|canceled|cancelling|canceling|cancellation|cancel your|you cancelled|has been cancelled)", combined, re.I):
         status = "cancelled"
 
     amount = None
@@ -1077,14 +999,10 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
     bc_m = RE_BILLING_CYCLE.search(body)
     if bc_m:
         raw = bc_m.group(1).lower()
-        if raw in ("month", "monthly"):
-            billing_cycle = "monthly"
-        elif raw in ("year", "yearly", "annual"):
-            billing_cycle = "yearly"
-        elif raw in ("week", "weekly"):
-            billing_cycle = "weekly"
-        elif raw == "quarterly":
-            billing_cycle = "quarterly"
+        if raw in ("month", "monthly"): billing_cycle = "monthly"
+        elif raw in ("year", "yearly", "annual"): billing_cycle = "yearly"
+        elif raw in ("week", "weekly"): billing_cycle = "weekly"
+        elif raw == "quarterly": billing_cycle = "quarterly"
 
     plan = None
     plan_m = RE_PLAN_NAME.search(body)
@@ -1093,11 +1011,7 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
         if len(candidate) < 30 and not re.search(r"\b(?:will|your|this|that|has|have|been|with|for|the|and|our|we|you|to|is|are|was|on|at|it|in)\b", candidate, re.I):
             plan = candidate
     if plan is None:
-        plan_m2 = re.search(
-            r"(?:the|your|our|this)\s+([A-Za-z][A-Za-z0-9\s.'\-+]{1,20}?)\s+"
-            r"(?:plan|tier|level|package|subscription)\b",
-            body, re.I
-        )
+        plan_m2 = re.search(r"(?:the|your|our|this)\s+([A-Za-z][A-Za-z0-9\s.'\-+]{1,20}?)\s+(?:plan|tier|level|package|subscription)\b", body, re.I)
         if plan_m2:
             candidate = plan_m2.group(1).strip()
             if len(candidate) < 30:
@@ -1108,15 +1022,13 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     if DATEUTIL_AVAILABLE:
         now = datetime.datetime.now()
-
         for m in RE_SUB_DATE.finditer(body):
             try:
                 dt = dateparser.parse(m.group(1), fuzzy=False, default=now)
                 if dt and dt > datetime.datetime(2000, 1, 1):
                     iso = dt.strftime("%Y-%m-%d")
                     ctx = body[max(0, m.start() - 60):m.end() + 60].lower()
-                    if re.search(r"(?:trial ends|trial ending|trial period ends|"
-                                 r"free trial ends|trial expires)", ctx):
+                    if re.search(r"(?:trial ends|trial ending|trial period ends|free trial ends|trial expires)", ctx):
                         trial_end = iso
                     elif status == "trial":
                         trial_end = iso
@@ -1155,14 +1067,8 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
         if next_billing is None and trial_end is None:
             for pat in [
-                re.compile(r"(?:renews|will renew|next renewal|next billing)[:\s]+"
-                           r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-                           r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-                           r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
-                re.compile(r"(?:charged|payment|billed)[:\s]+(?:on|the)\s+"
-                           r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-                           r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-                           r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
+                re.compile(r"(?:renews|will renew|next renewal|next billing)[:\s]+((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
+                re.compile(r"(?:charged|payment|billed)[:\s]+(?:on|the)\s+((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})", re.I),
             ]:
                 m = pat.search(body)
                 if m:
@@ -1175,25 +1081,12 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
                         pass
 
     confidence = 0
-    signals = 0
-
-    if known_sender:
-        confidence += 30
-        signals += 1
-    if amount:
-        confidence += 20
-        signals += 1
-    if billing_cycle:
-        confidence += 15
-        signals += 1
-    if next_billing or trial_end:
-        confidence += 20
-        signals += 1
-    if plan:
-        confidence += 10
-        signals += 1
-    if status == "trial":
-        confidence += 5
+    if known_sender: confidence += 30
+    if amount: confidence += 20
+    if billing_cycle: confidence += 15
+    if next_billing or trial_end: confidence += 20
+    if plan: confidence += 10
+    if status == "trial": confidence += 5
 
     if not known_sender and not amount:
         confidence = max(confidence, 15)
@@ -1205,14 +1098,13 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
 
     if service_name is None:
         domain = _sender_domain(sender)
-        # Safely strip known prefixes
         for prefix in ["mail.", "message.", "noreply.", "accounts.", "account.", "e."]:
             if domain.startswith(prefix):
                 domain = domain[len(prefix):]
                 break
         service_name = domain.split(".")[0].title()
 
-    result = {
+    return {
         "service": service_name or "Unknown",
         "plan": plan,
         "amount": amount,
@@ -1225,27 +1117,18 @@ def extract_subscription(text, subject="", sender="") -> dict | None:
         "sender": sender,
         "subject": subject,
     }
-    return result
-
 
 def format_subscription(sub, warn=False) -> str:
     parts = [c(sub["service"], Style.BOLD, Style.CYAN) if not warn else c(sub["service"], Style.BOLD, Style.YELLOW)]
-    if sub["plan"]:
-        parts.append(f"({sub['plan']})")
-    if sub["amount"]:
-        parts.append(sub["amount"])
-    if sub["billing_cycle"]:
-        parts.append(f"/{sub['billing_cycle']}")
-    if sub["next_billing"]:
-        parts.append(f"→ renews {sub['next_billing']}")
-    if sub["trial_end"]:
-        parts.append(c(f"⚠ trial ends {sub['trial_end']}", Style.YELLOW) if warn else f"trial ends {sub['trial_end']}")
-    if sub["status"] == "cancelled":
-        parts.append(c("❌ cancelled", Style.RED, Style.BOLD))
+    if sub["plan"]: parts.append(f"({sub['plan']})")
+    if sub["amount"]: parts.append(sub["amount"])
+    if sub["billing_cycle"]: parts.append(f"/{sub['billing_cycle']}")
+    if sub["next_billing"]: parts.append(f"→ renews {sub['next_billing']}")
+    if sub["trial_end"]: parts.append(c(f"⚠ trial ends {sub['trial_end']}", Style.YELLOW) if warn else f"trial ends {sub['trial_end']}")
+    if sub["status"] == "cancelled": parts.append(c("❌ cancelled", Style.RED, Style.BOLD))
     conf_bar = "█" * (sub["confidence"] // 10) + "░" * (10 - sub["confidence"] // 10)
     parts.append(c(f"({conf_bar} {sub['confidence']}%)", Style.DIM))
     return "  ".join(parts)
-
 
 def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -> list[dict]:
     now = datetime.datetime.now().date()
@@ -1269,7 +1152,6 @@ def check_subscription_warnings(subscriptions: list[dict], warn_days: int = 3) -
                 pass
     return warnings
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Google Calendar Integration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1279,7 +1161,6 @@ CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 def get_calendar_service():
     if not GOOGLE_AVAILABLE:
         return None
-
     creds = None
     if os.path.exists(CAL_TOKEN_FILE):
         try:
@@ -1288,7 +1169,6 @@ def get_calendar_service():
             creds = GoogleCreds.from_authorized_user_info(token_data, CAL_SCOPES)
         except Exception:
             pass
-
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
@@ -1297,16 +1177,13 @@ def get_calendar_service():
             _chmod_600(CAL_TOKEN_FILE)
         except Exception:
             return None
-
     if creds and creds.valid:
         try:
             service = build("calendar", "v3", credentials=creds)
             return service
         except Exception:
             return None
-
     return None
-
 
 def calendar_auth_flow():
     if not GOOGLE_AVAILABLE:
@@ -1351,17 +1228,13 @@ def calendar_auth_flow():
     print()
 
     try:
-        flow = InstalledAppFlow.from_client_config(
-            client_config, CAL_SCOPES,
-            redirect_uri="http://localhost:8080/"
-        )
+        flow = InstalledAppFlow.from_client_config(client_config, CAL_SCOPES, redirect_uri="http://localhost:8080/")
         creds = flow.run_local_server(
             port=8080,
             host="localhost",
             open_browser=True,
             success_message="✅ verify-code is now authorized! You can close this tab.",
         )
-
         token_data = json.loads(creds.to_json())
         with open(CAL_TOKEN_FILE, "w") as f:
             json.dump(token_data, f, indent=2)
@@ -1374,28 +1247,22 @@ def calendar_auth_flow():
         print()
         print(c("  ✅  Google Calendar authorized! Events can now be added.", Style.GREEN, Style.BOLD))
         return True
-
     except Exception as e:
         print(c(f"  ✗  Authorization failed: {e}", Style.RED))
         print("  Tip: Make sure your OAuth client is a 'Desktop app' type")
         print("  and the Calendar API is enabled in your Google Cloud project.")
         return False
 
-
 def add_event_to_calendar(event):
-    """Add an event to Google Calendar. Returns True on success."""
     service = get_calendar_service()
     if not service:
         return False
-
     try:
         local_tz = datetime.datetime.now().astimezone().tzinfo
-        
         start_iso = event["start"]
         if "+" not in start_iso and "Z" not in start_iso:
             start_dt = datetime.datetime.fromisoformat(start_iso).replace(tzinfo=local_tz)
             start_iso = start_dt.isoformat()
-            
         end_iso = event["end"]
         if "+" not in end_iso and "Z" not in end_iso:
             end_dt = datetime.datetime.fromisoformat(end_iso).replace(tzinfo=local_tz)
@@ -1417,7 +1284,6 @@ def add_event_to_calendar(event):
         print(c(f"  ✗  Calendar error: {e}", Style.RED), file=sys.stderr)
         return None
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # IMAP / Email
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1430,7 +1296,6 @@ def connect(creds):
     con.select("INBOX")
     return con
 
-
 def _parse_email_date(date_str):
     try:
         date = parsedate_to_datetime(date_str)
@@ -1442,21 +1307,17 @@ def _parse_email_date(date_str):
     except (ValueError, TypeError, IndexError):
         return None
 
-
 def find_newest_code(con, window, since_uid=0, known_senders_only=False, find_all=False):
-    """Return dict with code, sender, subject, age, uid, confidence, method, events, max_uid_seen."""
     now = datetime.datetime.now(datetime.timezone.utc)
     uids = []
-    
-    # IMAP SINCE is strictly a date, no time. We must use yesterday to avoid edge cases.
-    since_date = (now - window - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
+    since_dt = now - window - datetime.timedelta(days=1)
+    since_date = f"{since_dt.day}-{calendar.month_abbr[since_dt.month]}-{since_dt.year}"
     try:
         typ, data = con.uid('SEARCH', None, "SINCE", since_date)
         if typ == "OK" and data and data[0]:
             uids = data[0].split()
     except (imaplib.IMAP4.error, AttributeError):
         pass
-        
     if not uids:
         return None
 
@@ -1485,7 +1346,6 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False, find_al
             date = _parse_email_date(head.get("Date", ""))
             if date is None:
                 continue
-            
             age = now - date
             if age > window:
                 continue
@@ -1526,13 +1386,11 @@ def find_newest_code(con, window, since_uid=0, known_senders_only=False, find_al
 
     if find_all:
         return all_results
-
     if best_result is None:
         return {"uid": str(newest_uid_seen), "max_uid_seen": newest_uid_seen, "code": None,
                 "confidence": 0, "method": None, "sender": "", "subject": "", "age": None,
                 "events": [], "body": "", "link": None}
     return best_result
-
 
 def supports_idle(con):
     try:
@@ -1542,7 +1400,6 @@ def supports_idle(con):
     except Exception:
         return False
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Setup Wizard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1550,7 +1407,7 @@ def supports_idle(con):
 def setup():
     """Interactive, fun setup wizard."""
     print_banner()
-    print(c("  Welcome to verify-code v2.4! Let's get you set up. 🚀", Style.BOLD))
+    print(c("  Welcome to verify-code v2.5! Let's get you set up. 🚀", Style.BOLD))
     print()
     time.sleep(0.5)
 
@@ -1615,8 +1472,7 @@ def setup():
                     print("  or:          sudo apt install xclip (X11)")
                     install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
                     if install in ("y", "yes"):
-                        ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
-                                           capture_output=True)
+                        ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"], capture_output=True)
                         if ret.returncode == 0:
                             print(c("  ✅  wl-clipboard installed!", Style.GREEN))
                             clipboard_ok = True
@@ -1654,6 +1510,14 @@ def setup():
             save_creds(email_addr, password, host=provider_info["host"], port=provider_info["port"],
                        provider=provider, cal_token=cal_ok, secure=secure_seconds > 0, secure_timeout=secure_seconds)
             print()
+            
+            print(c("  ── Step 6: Form Filler (optional) ──", Style.CYAN, Style.BOLD))
+            print()
+            want_form = input(c("  ⌨️  Set up Form Filler data (encrypted)? (y/N): ", Style.BOLD)).strip().lower()
+            if want_form in ("y", "yes"):
+                setup_form_filler()
+            print()
+            
             print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
             print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
             print(c("  ╠══════════════════════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
@@ -1667,10 +1531,9 @@ def setup():
             print(c("  What now?", Style.BOLD))
             print("  •  verify-code              — one-shot: copy latest code/link")
             print("  •  verify-code daemon       — background: watch & auto-copy")
+            print("  •  verify-code fill         — fill forms manually")
             print("  •  verify-code scan         — scan inbox for events with dates/times")
             print("  •  verify-code install      — auto-start on login + install to PATH")
-            print("  •  verify-code auth         — (re-)auth Google Calendar")
-            print("  •  verify-code version      — show installed version")
             if secure_seconds > 0:
                 print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
             print()
@@ -1798,8 +1661,7 @@ def setup():
             print("  or:          sudo apt install xclip (X11)")
             install = input(c("  Install wl-clipboard now? (y/N): ", Style.BOLD)).strip().lower()
             if install in ("y", "yes"):
-                ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"],
-                                   capture_output=True)
+                ret = subprocess.run(["sudo", "apt", "install", "-y", "wl-clipboard"], capture_output=True)
                 if ret.returncode == 0:
                     print(c("  ✅  wl-clipboard installed!", Style.GREEN))
                     clipboard_ok = True
@@ -1828,6 +1690,13 @@ def setup():
                    provider=provider, cal_token=cal_ok, secure=True, secure_timeout=secure_seconds)
 
     print()
+    print(c("  ── Step 7: Form Filler (optional) ──", Style.CYAN, Style.BOLD))
+    print()
+    want_form = input(c("  ⌨️  Set up Form Filler data (encrypted)? (y/N): ", Style.BOLD)).strip().lower()
+    if want_form in ("y", "yes"):
+        setup_form_filler()
+
+    print()
     print(c("  ╔══════════════════════════════════════════════════════════╗", Style.GREEN, Style.BOLD))
     print(c("  ║           Setup Complete! 🎉             ║", Style.GREEN, Style.BOLD))
     print(c("  ╠══════════════════════════════════════════════════════════╣", Style.GREEN, Style.BOLD))
@@ -1841,15 +1710,13 @@ def setup():
     print(c("  What now?", Style.BOLD))
     print("  •  verify-code              — one-shot: copy latest code/link")
     print("  •  verify-code daemon       — background: watch & auto-copy")
+    print("  •  verify-code fill         — fill forms manually")
     print("  •  verify-code scan         — scan inbox for events with dates/times")
-    print("  •  verify-code install      — auto-start on login + install to PATH")
-    print("  •  verify-code auth         — (re-)auth Google Calendar")
-    print("  •  verify-code version      — show installed version")
     if secure_seconds > 0:
         print(c(f"  •  🔒 Secure mode: {secure_seconds}s auto-erase active", Style.YELLOW))
 
     print()
-    print(c("  ── Step 7: Install to PATH ──", Style.CYAN, Style.BOLD))
+    print(c("  ── Step 8: Install to PATH ──", Style.CYAN, Style.BOLD))
     print()
     local_bin = os.path.expanduser("~/.local/bin")
     local_script = os.path.join(local_bin, "verify-code")
@@ -1873,19 +1740,16 @@ def setup():
                 print(c(f"  ✗  Failed to copy script: {e}", Style.RED))
     print()
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Modes
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run(args):
-    """One-shot mode: find and copy the newest code."""
     creds = load_creds()
     window = datetime.timedelta(minutes=args.minutes)
     con = connect(creds)
     try:
-        res = find_newest_code(con, window, since_uid=0,
-                               known_senders_only=args.known_senders)
+        res = find_newest_code(con, window, since_uid=0, known_senders_only=args.known_senders)
     finally:
         try:
             con.close()
@@ -2017,7 +1881,6 @@ def run(args):
                     print(c(f"      ⚠ Trial ends: {sub['trial_end']}", Style.YELLOW))
                 print()
 
-
 def history_cmd():
     print()
     print(c("  ╔══════════════════════════════════════════════════════════╗", Style.CYAN, Style.BOLD))
@@ -2068,7 +1931,6 @@ def history_cmd():
     print("  Full log: ~/.local/share/verify-code/log.txt (Linux/macOS)")
     print("  or:       %APPDATA%\\verify-code\\data\\log.txt (Windows)")
     print()
-
 
 def subscriptions_cmd(args):
     subs = load_subscriptions()
@@ -2184,7 +2046,6 @@ def subscriptions_cmd(args):
     print(c("  Tip:", Style.DIM), "subscriptions are auto-detected from inbox emails.")
     print(c("  Run:", Style.DIM), "verify-code daemon  (to track in background automatically)")
     print()
-
 
 def dashboard_cmd(args):
     """Launch a local web dashboard showing subscriptions, code history, and events."""
@@ -2597,7 +2458,6 @@ setInterval(() => loadAll(false), 30000);
         print(c("  🛑  Dashboard server stopped.", Style.YELLOW))
         httpd.shutdown()
 
-
 def daemon_run(args):
     """Background daemon mode: watch inbox, auto-copy codes, extract events."""
     creds = load_creds()
@@ -2610,7 +2470,6 @@ def daemon_run(args):
     seen_subscriptions = OrderedDict((k, True) for k in state.get("seen_subscriptions", []))
     
     interval = args.interval
-
     have_calendar = bool(get_calendar_service())
 
     if args.secure_timeout > 0:
@@ -2636,6 +2495,17 @@ def daemon_run(args):
     if have_calendar:
         print(f"     Calendar min confidence: {args.cal_threshold}%")
     print(f"     Last UID: {last_uid}", flush=True)
+
+    if FORM_FILLER_AVAILABLE and os.path.exists(FORM_DATA_FILE):
+        try:
+            keyboard.add_hotkey('ctrl+shift+f', trigger_form_fill)
+            print(c("  ⌨️  Form filler hotkey registered: Ctrl+Shift+F", Style.GREEN))
+        except Exception as e:
+            print(c(f"  ⚠  Failed to register form filler hotkey: {e}", Style.YELLOW))
+            if not IS_WINDOWS and os.geteuid() != 0:
+                print(c("     (Linux requires root/sudo for global hotkeys)", Style.DIM))
+    elif FORM_FILLER_AVAILABLE:
+        print(c("  ℹ️  Form filler ready but no data saved. Run setup to configure.", Style.DIM))
 
     while True:
         try:
@@ -2776,7 +2646,6 @@ def daemon_run(args):
             print(c("\n  🏹  Daemon stopped.", Style.YELLOW), flush=True)
             break
 
-
 def scan_mode(args):
     """Scan inbox for events with dates/times (no code copy)."""
     creds = load_creds()
@@ -2850,7 +2719,6 @@ def scan_mode(args):
         print("  No events with dates/times found.")
         print("  Tip: Try --minutes 60 to scan a wider window.")
         print()
-
 
 def install_service(args):
     """Install: download latest, copy to PATH, set up auto-start, run setup wizard."""
@@ -2970,7 +2838,6 @@ WantedBy=default.target
         print("  To view logs:")
         print("    journalctl --user -u verify-code -f")
 
-
 def uninstall():
     """Remove verify-code: script, credentials, state, service, calendar token."""
     print_banner()
@@ -3055,7 +2922,6 @@ def uninstall():
     print()
     print(c("  verify-code has been removed. 👋", Style.CYAN, Style.BOLD))
 
-
 def download_latest():
     """Download the latest verify-code from GitHub to the install path."""
     if IS_WINDOWS:
@@ -3107,7 +2973,6 @@ def download_latest():
     print()
 
     return version_str
-
 
 def self_install(script_path=None):
     """Download the latest verify-code from GitHub and run the setup wizard."""
@@ -3183,7 +3048,6 @@ def self_install(script_path=None):
     print("    verify-code update       — get latest from GitHub")
     print("    verify-code uninstall    — remove everything")
     print()
-
 
 def update_self():
     """Update verify-code to the latest version from GitHub."""
@@ -3283,14 +3147,13 @@ def update_self():
             try: os.remove(p)
             except Exception: pass
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(
-        description=f"verify-code v{__version__} — Copy codes, find events, track subscriptions.",
+        description=f"verify-code v{__version__} — Copy codes, find events, track subscriptions, fill forms.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -3298,7 +3161,8 @@ Examples:
   verify-code                    # One-shot: copy latest code/link
   verify-code scan               # Scan inbox for events
   verify-code scan --subscriptions  # Scan for subscriptions
-  verify-code daemon             # Background: watch, copy, calendar
+  verify-code daemon             # Background: watch, copy, calendar, form fill
+  verify-code fill               # Manually trigger form filling (3s delay)
   verify-code subscriptions      # View tracked subscriptions
   verify-code dashboard          # Launch web dashboard in browser
   verify-code install            # Install to ~/.local/bin + systemd service
@@ -3320,8 +3184,8 @@ One-liner install (Windows PowerShell):
 """
     )
     p.add_argument("cmd", nargs="?", default="run",
-                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version", "history", "subscriptions", "dashboard"],
-                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version | history | subscriptions | dashboard")
+                   choices=["run", "setup", "daemon", "install", "uninstall", "update", "scan", "auth", "version", "history", "subscriptions", "dashboard", "fill"],
+                   help="run (default) | setup | daemon | install | uninstall | update | scan | auth | version | history | subscriptions | dashboard | fill")
     p.add_argument("--minutes", type=int, default=10,
                    help="lookback window in minutes (default 10)")
     p.add_argument("--interval", type=int, default=15,
@@ -3354,7 +3218,7 @@ One-liner install (Windows PowerShell):
         setup()
     elif args.cmd == "daemon":
         if not args.subscriptions:
-            args.subscriptions = True # Default for daemon, but can be toggled if explicitly disabled? The original forced it.
+            args.subscriptions = True
         daemon_run(args)
     elif args.cmd == "install":
         if sys.argv[0] in ("-", "/dev/stdin"):
@@ -3378,9 +3242,10 @@ One-liner install (Windows PowerShell):
         subscriptions_cmd(args)
     elif args.cmd == "dashboard":
         dashboard_cmd(args)
+    elif args.cmd == "fill":
+        trigger_form_fill()
     else:
         run(args)
-
 
 if __name__ == "__main__":
     main()
